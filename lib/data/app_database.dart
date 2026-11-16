@@ -26,7 +26,7 @@ class AppDatabase {
     final path = p.join(await getDatabasesPath(), 'mis_horas.db');
     _database = await openDatabase(
       path,
-      version: 5,
+      version: 9,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE accounts (
@@ -62,6 +62,7 @@ class AppDatabase {
           CREATE TABLE attachments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
+            account_id INTEGER,
             name TEXT NOT NULL,
             mime TEXT NOT NULL,
             size INTEGER NOT NULL,
@@ -79,19 +80,49 @@ class AppDatabase {
             id INTEGER PRIMARY KEY CHECK (id = 1),
             daily_targets TEXT NOT NULL,
             date_overrides TEXT NOT NULL DEFAULT '',
-            week_start INTEGER NOT NULL DEFAULT 1
+            week_start INTEGER NOT NULL DEFAULT 1,
+            active_account_id INTEGER
           )
         ''');
-        await db.insert('accounts', {
+        await db.execute('''
+          CREATE TABLE account_targets (
+            account_id INTEGER PRIMARY KEY,
+            daily_targets TEXT NOT NULL
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE medical_time (
+            date TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            minutes INTEGER NOT NULL,
+            PRIMARY KEY (date, account_id)
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE account_days (
+            date TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'work',
+            note TEXT NOT NULL DEFAULT '',
+            target_override INTEGER,
+            PRIMARY KEY (date, account_id)
+          )
+        ''');
+        final accountId = await db.insert('accounts', {
           'name': 'Trabajo',
           'color': 0xff3978f6,
           'archived': 0,
+        });
+        await db.insert('account_targets', {
+          'account_id': accountId,
+          'daily_targets': '480,480,480,480,480,0,0',
         });
         await db.insert('settings', {
           'id': 1,
           'daily_targets': '480,480,480,480,480,0,0',
           'date_overrides': '',
           'week_start': 1,
+          'active_account_id': accountId,
         });
       },
       onUpgrade: (db, oldVersion, newVersion) async {
@@ -129,6 +160,191 @@ class AppDatabase {
           await db.execute(
             'ALTER TABLE attachments ADD COLUMN thumbnail_path TEXT',
           );
+        }
+        if (oldVersion < 6) {
+          await db.execute('''
+            CREATE TABLE account_targets (
+              account_id INTEGER PRIMARY KEY,
+              daily_targets TEXT NOT NULL
+            )
+          ''');
+          await db.execute(
+            'ALTER TABLE settings ADD COLUMN active_account_id INTEGER',
+          );
+          final accounts = await db.query(
+            'accounts',
+            columns: ['id', 'archived'],
+            orderBy: 'id',
+          );
+          final activeAccounts = accounts.where(
+            (account) => account['archived'] == 0,
+          );
+          final legacyAccount = activeAccounts.where(
+            (account) => (account['name'] as String).toLowerCase() == 'trabajo',
+          );
+          final activeId = legacyAccount.isNotEmpty
+              ? legacyAccount.first['id'] as int
+              : activeAccounts.isEmpty
+              ? null
+              : activeAccounts.first['id'] as int;
+          final settings = await db.query(
+            'settings',
+            columns: ['daily_targets'],
+            where: 'id = 1',
+            limit: 1,
+          );
+          const emptyTargets = '0,0,0,0,0,0,0';
+          final legacyTargets = settings.isEmpty
+              ? '480,480,480,480,480,0,0'
+              : settings.first['daily_targets'] as String;
+          for (final account in accounts) {
+            await db.insert('account_targets', {
+              'account_id': account['id'],
+              'daily_targets': account['id'] == activeId
+                  ? legacyTargets
+                  : emptyTargets,
+            });
+          }
+          if (activeId != null) {
+            await db.update('settings', {
+              'active_account_id': activeId,
+            }, where: 'id = 1');
+          }
+        }
+        if (oldVersion < 7) {
+          await db.execute(
+            'ALTER TABLE attachments ADD COLUMN account_id INTEGER',
+          );
+          final accounts = await db.query(
+            'accounts',
+            columns: ['id'],
+            where: "lower(name) = 'trabajo'",
+            orderBy: 'archived, id',
+            limit: 1,
+          );
+          final fallbackAccountId = accounts.isNotEmpty
+              ? accounts.first['id'] as int
+              : (await db.query(
+                      'accounts',
+                      columns: ['id'],
+                      where: 'archived = 0',
+                      orderBy: 'id',
+                      limit: 1,
+                    )).firstOrNull?['id']
+                    as int?;
+          final attachments = await db.query(
+            'attachments',
+            columns: ['id', 'date'],
+            orderBy: 'id',
+          );
+          for (final attachment in attachments) {
+            final movements = await db.query(
+              'movements',
+              columns: ['account_id'],
+              where: 'date = ?',
+              whereArgs: [attachment['date']],
+            );
+            final owners = movements
+                .map((movement) => movement['account_id'] as int)
+                .toSet();
+            final accountId = owners.length == 1
+                ? owners.first
+                : fallbackAccountId;
+            if (accountId != null) {
+              await db.update(
+                'attachments',
+                {'account_id': accountId},
+                where: 'id = ?',
+                whereArgs: [attachment['id']],
+              );
+            }
+          }
+        }
+        if (oldVersion < 8) {
+          await db.execute('''
+            CREATE TABLE medical_time (
+              date TEXT NOT NULL,
+              account_id INTEGER NOT NULL,
+              minutes INTEGER NOT NULL,
+              PRIMARY KEY (date, account_id)
+            )
+          ''');
+        }
+        if (oldVersion < 9) {
+          await db.execute('''
+            CREATE TABLE account_days (
+              date TEXT NOT NULL,
+              account_id INTEGER NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'work',
+              note TEXT NOT NULL DEFAULT '',
+              target_override INTEGER,
+              PRIMARY KEY (date, account_id)
+            )
+          ''');
+          final accounts = await db.query(
+            'accounts',
+            columns: ['id', 'name'],
+            orderBy: 'id',
+          );
+          final settings = await db.query(
+            'settings',
+            columns: ['active_account_id', 'date_overrides'],
+            where: 'id = 1',
+            limit: 1,
+          );
+          final activeId = settings.isEmpty
+              ? null
+              : settings.first['active_account_id'] as int?;
+          final legacyAccount = accounts.where(
+            (account) => (account['name'] as String).toLowerCase() == 'trabajo',
+          );
+          final legacyAccountId = legacyAccount.isNotEmpty
+              ? legacyAccount.first['id'] as int
+              : activeId ??
+                    (accounts.isEmpty ? null : accounts.first['id'] as int);
+          if (legacyAccountId != null) {
+            final days = await db.query('days', orderBy: 'date');
+            for (final day in days) {
+              await db.insert('account_days', {
+                'date': day['date'],
+                'account_id': legacyAccountId,
+                'kind': day['kind'] ?? 'work',
+                'note': day['note'] ?? '',
+              }, conflictAlgorithm: ConflictAlgorithm.replace);
+            }
+            final rawOverrides = settings.isEmpty
+                ? ''
+                : settings.first['date_overrides'] as String? ?? '';
+            for (final entry in rawOverrides.split(';')) {
+              final pair = entry.split('=');
+              if (pair.length != 2) continue;
+              final minutes = int.tryParse(pair[1]);
+              if (minutes == null || minutes < 0 || minutes > 1440) continue;
+              final current = await db.query(
+                'account_days',
+                where: 'date = ? AND account_id = ?',
+                whereArgs: [pair[0], legacyAccountId],
+                limit: 1,
+              );
+              if (current.isEmpty) {
+                await db.insert('account_days', {
+                  'date': pair[0],
+                  'account_id': legacyAccountId,
+                  'kind': 'work',
+                  'note': '',
+                  'target_override': minutes,
+                });
+              } else {
+                await db.update(
+                  'account_days',
+                  {'target_override': minutes},
+                  where: 'date = ? AND account_id = ?',
+                  whereArgs: [pair[0], legacyAccountId],
+                );
+              }
+            }
+          }
+          await db.update('settings', {'date_overrides': ''}, where: 'id = 1');
         }
       },
     );
@@ -190,6 +406,64 @@ class AppDatabase {
     return db.query('accounts', orderBy: 'archived, name');
   }
 
+  Future<int> activeAccountId() async {
+    final db = await database;
+    final rows = await db.query(
+      'accounts',
+      columns: ['id'],
+      where: 'archived = 0',
+      orderBy: 'id',
+    );
+    if (rows.isEmpty) {
+      throw StateError('Debe quedar al menos una cuenta activa.');
+    }
+    final settings = await db.query(
+      'settings',
+      columns: ['active_account_id'],
+      where: 'id = 1',
+      limit: 1,
+    );
+    final selectedId = settings.isEmpty
+        ? null
+        : settings.first['active_account_id'] as int?;
+    if (selectedId != null &&
+        rows.any((account) => account['id'] == selectedId)) {
+      return selectedId;
+    }
+    final fallbackId = rows.first['id'] as int;
+    await db.update('settings', {
+      'active_account_id': fallbackId,
+    }, where: 'id = 1');
+    return fallbackId;
+  }
+
+  Future<void> setActiveAccount(int accountId) async {
+    final db = await database;
+    final rows = await db.query(
+      'accounts',
+      columns: ['id'],
+      where: 'id = ? AND archived = 0',
+      whereArgs: [accountId],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      throw StateError('La cuenta seleccionada no está activa.');
+    }
+    final targets = await db.query(
+      'account_targets',
+      columns: ['daily_targets'],
+      where: 'account_id = ?',
+      whereArgs: [accountId],
+      limit: 1,
+    );
+    final changes = <String, Object?>{'active_account_id': accountId};
+    if (targets.isNotEmpty) {
+      changes['daily_targets'] = targets.first['daily_targets'];
+    }
+    await db.update('settings', changes, where: 'id = 1');
+    _notifyChanged();
+  }
+
   Future<int> createAccount(String name, int color) async {
     final cleanName = name.trim().replaceAll(RegExp(r'\s+'), ' ');
     if (cleanName.isEmpty) {
@@ -213,6 +487,10 @@ class AppDatabase {
       'color': color,
       'archived': 0,
     });
+    await db.insert('account_targets', {
+      'account_id': id,
+      'daily_targets': '0,0,0,0,0,0,0',
+    });
     _notifyChanged();
     return id;
   }
@@ -225,6 +503,7 @@ class AppDatabase {
   }) async {
     final db = await database;
     final changes = <String, Object?>{};
+    final activeId = await activeAccountId();
     if (archived == 1) {
       final selected = await db.query(
         'accounts',
@@ -267,12 +546,27 @@ class AppDatabase {
     if (archived != null) changes['archived'] = archived;
     if (changes.isNotEmpty) {
       await db.update('accounts', changes, where: 'id = ?', whereArgs: [id]);
+      if (archived == 1 && activeId == id) {
+        final next = await db.query(
+          'accounts',
+          columns: ['id'],
+          where: 'archived = 0',
+          orderBy: 'id',
+          limit: 1,
+        );
+        if (next.isNotEmpty) {
+          await db.update('settings', {
+            'active_account_id': next.first['id'],
+          }, where: 'id = 1');
+        }
+      }
       _notifyChanged();
     }
   }
 
   Future<void> deleteAccount(int id) async {
     final db = await database;
+    final activeId = await activeAccountId();
     final movements = await db.query(
       'movements',
       columns: ['id'],
@@ -283,6 +577,40 @@ class AppDatabase {
     if (movements.isNotEmpty) {
       throw StateError(
         'La cuenta tiene movimientos. Archívala si ya no la usas.',
+      );
+    }
+    final medicalRecords = await db.query(
+      'medical_time',
+      columns: ['date'],
+      where: 'account_id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (medicalRecords.isNotEmpty) {
+      throw StateError(
+        'La cuenta tiene registros médicos. Archívala si ya no la usas.',
+      );
+    }
+    final attachments = await db.query(
+      'attachments',
+      columns: ['id'],
+      where: 'account_id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (attachments.isNotEmpty) {
+      throw StateError('La cuenta tiene adjuntos. Archívala si ya no la usas.');
+    }
+    final accountDays = await db.query(
+      'account_days',
+      columns: ['date'],
+      where: "account_id = ? AND (kind != 'work' OR note != '' OR target_override IS NOT NULL)",
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (accountDays.isNotEmpty) {
+      throw StateError(
+        'La cuenta tiene estados, notas u objetivos por fecha. Archívala si ya no la usas.',
       );
     }
     final active = await db.query(
@@ -302,6 +630,27 @@ class AppDatabase {
         active.length <= 1) {
       throw StateError('Debe quedar al menos una cuenta activa.');
     }
+    if (activeId == id) {
+      final next = await db.query(
+        'accounts',
+        columns: ['id'],
+        where: 'archived = 0 AND id != ?',
+        whereArgs: [id],
+        orderBy: 'id',
+        limit: 1,
+      );
+      if (next.isNotEmpty) {
+        await db.update('settings', {
+          'active_account_id': next.first['id'],
+        }, where: 'id = 1');
+      }
+    }
+    await db.delete(
+      'account_targets',
+      where: 'account_id = ?',
+      whereArgs: [id],
+    );
+    await db.delete('account_days', where: 'account_id = ?', whereArgs: [id]);
     await db.delete('accounts', where: 'id = ?', whereArgs: [id]);
     _notifyChanged();
   }
@@ -312,15 +661,95 @@ class AppDatabase {
     return rows.map(WorkMovement.fromMap).toList();
   }
 
+  Future<Map<int, int>> workedMinutesByAccount() async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT account_id,
+        SUM(end_minute - start_minute
+          + CASE WHEN crosses_midnight = 1 THEN 1440 ELSE 0 END
+          - break_minutes) AS worked_minutes
+      FROM movements
+      GROUP BY account_id
+    ''');
+    return {
+      for (final row in rows)
+        row['account_id'] as int: (row['worked_minutes'] as num).toInt(),
+    };
+  }
+
+  Future<Map<String, int>> medicalMinutesBetween(
+    DateTime from,
+    DateTime through, {
+    int? accountId,
+  }) async {
+    final db = await database;
+    final rows = accountId == null
+        ? await db.rawQuery(
+            'SELECT date, SUM(minutes) AS minutes FROM medical_time '
+            'WHERE date BETWEEN ? AND ? GROUP BY date',
+            [dateKey(from), dateKey(through)],
+          )
+        : await db.query(
+            'medical_time',
+            columns: ['date', 'minutes'],
+            where: 'date BETWEEN ? AND ? AND account_id = ?',
+            whereArgs: [dateKey(from), dateKey(through), accountId],
+          );
+    return {
+      for (final row in rows) row['date'] as String: row['minutes'] as int,
+    };
+  }
+
+  Future<void> saveMedicalMinutes({
+    required DateTime date,
+    required int accountId,
+    required int minutes,
+  }) async {
+    if (minutes < 0 || minutes > 1440) {
+      throw ArgumentError('El tiempo médico debe estar entre 0 y 24 horas.');
+    }
+    final db = await database;
+    final account = await db.query(
+      'accounts',
+      columns: ['id'],
+      where: 'id = ? AND archived = 0',
+      whereArgs: [accountId],
+      limit: 1,
+    );
+    if (account.isEmpty) {
+      throw StateError('La cuenta seleccionada ya no está activa.');
+    }
+    final key = dateKey(date);
+    if (minutes == 0) {
+      await db.delete(
+        'medical_time',
+        where: 'date = ? AND account_id = ?',
+        whereArgs: [key, accountId],
+      );
+    } else {
+      await db.insert('medical_time', {
+        'date': key,
+        'account_id': accountId,
+        'minutes': minutes,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    _notifyChanged();
+  }
+
   Future<List<WorkMovement>> movementsBetween(
     DateTime from,
-    DateTime through,
-  ) async {
+    DateTime through, {
+    int? accountId,
+  }) async {
     final db = await database;
     final rows = await db.query(
       'movements',
-      where: 'date BETWEEN ? AND ?',
-      whereArgs: [dateKey(from), dateKey(through)],
+      where: accountId == null
+          ? 'date BETWEEN ? AND ?'
+          : 'date BETWEEN ? AND ? AND account_id = ?',
+      whereArgs: accountId == null
+          ? [dateKey(from), dateKey(through)]
+          : [dateKey(from), dateKey(through), accountId],
       orderBy: 'date, start_minute',
     );
     return rows.map(WorkMovement.fromMap).toList();
@@ -328,13 +757,15 @@ class AppDatabase {
 
   Future<Map<String, DayKind>> dayKindsBetween(
     DateTime from,
-    DateTime through,
-  ) async {
+    DateTime through, {
+    required int accountId,
+  }) async {
     final db = await database;
     final rows = await db.query(
-      'days',
-      where: 'date BETWEEN ? AND ?',
-      whereArgs: [dateKey(from), dateKey(through)],
+      'account_days',
+      columns: ['date', 'kind'],
+      where: 'date BETWEEN ? AND ? AND account_id = ?',
+      whereArgs: [dateKey(from), dateKey(through), accountId],
     );
     return {
       for (final row in rows)
@@ -342,30 +773,40 @@ class AppDatabase {
     };
   }
 
-  Future<void> saveDayNote(DateTime date, String note) async {
+  Future<void> saveDayNote(
+    DateTime date,
+    String note, {
+    required int accountId,
+  }) async {
     final db = await database;
     final key = dateKey(date);
     final current = await db.query(
-      'days',
-      columns: ['kind'],
-      where: 'date = ?',
-      whereArgs: [key],
+      'account_days',
+      where: 'date = ? AND account_id = ?',
+      whereArgs: [key, accountId],
       limit: 1,
     );
-    await db.insert('days', {
+    await db.insert('account_days', {
       'date': key,
+      'account_id': accountId,
       'kind': current.isEmpty ? 'work' : current.first['kind'] ?? 'work',
       'note': note.trim(),
+      'target_override': current.isEmpty
+          ? null
+          : current.first['target_override'],
     }, conflictAlgorithm: ConflictAlgorithm.replace);
     _notifyChanged();
   }
 
-  Future<List<Map<String, Object?>>> attachmentsForDate(DateTime date) async {
+  Future<List<Map<String, Object?>>> attachmentsForDate(
+    DateTime date, {
+    required int accountId,
+  }) async {
     final db = await database;
     final rows = await db.query(
       'attachments',
-      where: 'date = ?',
-      whereArgs: [dateKey(date)],
+      where: 'date = ? AND account_id = ?',
+      whereArgs: [dateKey(date), accountId],
       orderBy: 'created_at',
     );
     final store = await AttachmentStore.open();
@@ -384,27 +825,31 @@ class AppDatabase {
 
   Future<Map<String, int>> attachmentCountsBetween(
     DateTime from,
-    DateTime through,
-  ) async {
+    DateTime through, {
+    int? accountId,
+  }) async {
     final db = await database;
     final rows = await db.rawQuery(
-      'SELECT date, COUNT(*) AS count FROM attachments '
-      'WHERE date BETWEEN ? AND ? GROUP BY date',
-      [dateKey(from), dateKey(through)],
+      'SELECT date, COUNT(*) AS count FROM attachments WHERE date BETWEEN ? AND ? '
+      '${accountId == null ? '' : 'AND account_id = ? '}GROUP BY date',
+      accountId == null
+          ? [dateKey(from), dateKey(through)]
+          : [dateKey(from), dateKey(through), accountId],
     );
     return {for (final row in rows) row['date'] as String: row['count'] as int};
   }
 
   Future<Map<String, String>> dayNotesBetween(
     DateTime from,
-    DateTime through,
-  ) async {
+    DateTime through, {
+    required int accountId,
+  }) async {
     final db = await database;
     final rows = await db.query(
-      'days',
+      'account_days',
       columns: ['date', 'note'],
-      where: 'date BETWEEN ? AND ?',
-      whereArgs: [dateKey(from), dateKey(through)],
+      where: 'date BETWEEN ? AND ? AND account_id = ?',
+      whereArgs: [dateKey(from), dateKey(through), accountId],
     );
     return {
       for (final row in rows)
@@ -415,6 +860,7 @@ class AppDatabase {
 
   Future<int> addAttachment({
     required DateTime date,
+    required int accountId,
     required String name,
     required String mime,
     required Stream<List<int>> bytes,
@@ -422,6 +868,7 @@ class AppDatabase {
     final db = await database;
     final id = await db.insert('attachments', {
       'date': dateKey(date),
+      'account_id': accountId,
       'name': name,
       'mime': mime,
       'size': 0,
@@ -484,6 +931,9 @@ class AppDatabase {
     required List<int> targets,
     required Map<String, int> overrides,
     required int weekStart,
+    Map<String, List<int>> accountTargets = const {},
+    List<Map<String, Object?>> medicalTime = const [],
+    String? activeAccountId,
   }) async {
     final db = await database;
     final store = await AttachmentStore.open();
@@ -517,6 +967,9 @@ class AppDatabase {
         await transaction.delete('movements');
         await transaction.delete('attachments');
         await transaction.delete('days');
+        await transaction.delete('account_days');
+        await transaction.delete('medical_time');
+        await transaction.delete('account_targets');
         await transaction.delete('accounts');
 
         final accountIds = <String, int>{};
@@ -536,6 +989,42 @@ class AppDatabase {
             'archived': 0,
           });
           accountIds['Trabajo'] = id;
+        }
+        final legacyAccountKey =
+            accounts
+                .where(
+                  (account) =>
+                      (account['name'] as String).toLowerCase() == 'trabajo',
+                )
+                .map((account) => account['id'].toString())
+                .firstOrNull ??
+            activeAccountId ??
+            accountIds.keys.first;
+        final legacyAccountId =
+            accountIds[legacyAccountKey] ?? accountIds.values.first;
+        for (final entry in accountIds.entries) {
+          final accountSchedule =
+              accountTargets[entry.key] ??
+              (entry.key == accountIds.keys.first
+                  ? targets
+                  : const <int>[0, 0, 0, 0, 0, 0, 0]);
+          await transaction.insert('account_targets', {
+            'account_id': entry.value,
+            'daily_targets': accountSchedule.join(','),
+          });
+        }
+        for (final entry in medicalTime) {
+          final accountId = accountIds[entry['accountId']?.toString()];
+          if (accountId == null) {
+            throw StateError(
+              'Un registro médico hace referencia a una cuenta inexistente.',
+            );
+          }
+          await transaction.insert('medical_time', {
+            'date': entry['date'],
+            'account_id': accountId,
+            'minutes': entry['minutes'],
+          });
         }
 
         for (final movement in movements) {
@@ -560,15 +1049,46 @@ class AppDatabase {
         }
 
         for (final day in days) {
+          final accountId =
+              accountIds[day['accountId']?.toString()] ?? legacyAccountId;
+          final date = day['date'] as String;
+          final kind = day['kind'] ?? 'work';
+          final note = day['note'] ?? '';
+          final targetOverride = day['targetOverride'];
+          await transaction.insert('account_days', {
+            'date': date,
+            'account_id': accountId,
+            'kind': kind,
+            'note': note,
+            'target_override': targetOverride,
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
           await transaction.insert('days', {
-            'date': day['date'],
-            'kind': day['kind'] ?? 'work',
-            'note': day['note'] ?? '',
+            'date': date,
+            'kind': kind,
+            'note': note,
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        }
+        for (final entry in overrides.entries) {
+          final current = await transaction.query(
+            'account_days',
+            where: 'date = ? AND account_id = ?',
+            whereArgs: [entry.key, legacyAccountId],
+            limit: 1,
+          );
+          await transaction.insert('account_days', {
+            'date': entry.key,
+            'account_id': legacyAccountId,
+            'kind': current.isEmpty ? 'work' : current.first['kind'] ?? 'work',
+            'note': current.isEmpty ? '' : current.first['note'] ?? '',
+            'target_override': entry.value,
           }, conflictAlgorithm: ConflictAlgorithm.replace);
         }
         for (final staged in stagedAttachments) {
           final attachment = staged.row;
           final date = attachment['date'] as String;
+          final accountId =
+              accountIds[attachment['accountId']?.toString()] ??
+              accountIds.values.first;
           await transaction.insert('days', {
             'date': date,
             'kind': 'work',
@@ -576,6 +1096,7 @@ class AppDatabase {
           }, conflictAlgorithm: ConflictAlgorithm.ignore);
           await transaction.insert('attachments', {
             'date': date,
+            'account_id': accountId,
             'name': staged.file.name,
             'mime': staged.file.mime,
             'size': staged.file.size,
@@ -586,14 +1107,13 @@ class AppDatabase {
           });
         }
 
-        final overrideString = overrides.entries
-            .map((entry) => '${entry.key}=${entry.value}')
-            .join(';');
         await transaction.insert('settings', {
           'id': 1,
           'daily_targets': targets.join(','),
-          'date_overrides': overrideString,
+          'date_overrides': '',
           'week_start': weekStart,
+          'active_account_id':
+              accountIds[activeAccountId] ?? accountIds.values.first,
         }, conflictAlgorithm: ConflictAlgorithm.replace);
       });
       for (final previous in previousAttachments) {
@@ -635,25 +1155,92 @@ class AppDatabase {
     );
   }
 
-  Future<List<int>> dailyTargets() async {
+  Future<List<int>> dailyTargets({int? accountId}) async {
     final db = await database;
-    final row = await db.query('settings', where: 'id = 1', limit: 1);
-    if (row.isEmpty) return [480, 480, 480, 480, 480, 0, 0];
-    return (row.first['daily_targets'] as String)
+    final selectedId = accountId ?? await activeAccountId();
+    final accountRows = await db.query(
+      'account_targets',
+      columns: ['daily_targets'],
+      where: 'account_id = ?',
+      whereArgs: [selectedId],
+      limit: 1,
+    );
+    final legacyRows = accountRows.isEmpty
+        ? await db.query(
+            'settings',
+            columns: ['daily_targets'],
+            where: 'id = 1',
+            limit: 1,
+          )
+        : accountRows;
+    if (legacyRows.isEmpty) return [480, 480, 480, 480, 480, 0, 0];
+    return (legacyRows.first['daily_targets'] as String)
         .split(',')
         .map(int.parse)
         .toList();
   }
 
-  Future<void> saveDailyTargets(List<int> targets) async {
+  Future<Map<int, List<int>>> allAccountTargets({
+    bool activeOnly = false,
+  }) async {
+    final db = await database;
+    final accounts = await db.query(
+      'accounts',
+      columns: ['id'],
+      where: activeOnly ? 'archived = 0' : null,
+      orderBy: 'id',
+    );
+    final rows = await db.query('account_targets');
+    final targetsById = {
+      for (final row in rows)
+        row['account_id'] as int: (row['daily_targets'] as String)
+            .split(',')
+            .map(int.parse)
+            .toList(),
+    };
+    final legacy = await db.query(
+      'settings',
+      columns: ['daily_targets'],
+      where: 'id = 1',
+      limit: 1,
+    );
+    final fallback = legacy.isEmpty
+        ? <int>[480, 480, 480, 480, 480, 0, 0]
+        : (legacy.first['daily_targets'] as String)
+              .split(',')
+              .map(int.parse)
+              .toList();
+    return {
+      for (var index = 0; index < accounts.length; index++)
+        accounts[index]['id'] as int:
+            targetsById[accounts[index]['id']] ??
+            (index == 0 ? fallback : <int>[0, 0, 0, 0, 0, 0, 0]),
+    };
+  }
+
+  Future<void> saveDailyTargets(List<int> targets, {int? accountId}) async {
     if (targets.length != 7 ||
         targets.any((minutes) => minutes < 0 || minutes > 1440)) {
       throw ArgumentError('Cada objetivo debe estar entre 0 y 24 horas.');
     }
     final db = await database;
-    await db.update('settings', {
-      'daily_targets': targets.join(','),
-    }, where: 'id = 1');
+    final selectedId = accountId ?? await activeAccountId();
+    final account = await db.query(
+      'accounts',
+      columns: ['id'],
+      where: 'id = ?',
+      whereArgs: [selectedId],
+      limit: 1,
+    );
+    if (account.isEmpty) throw StateError('La cuenta ya no existe.');
+    final encoded = targets.join(',');
+    await db.insert('account_targets', {
+      'account_id': selectedId,
+      'daily_targets': encoded,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    if (selectedId == await activeAccountId()) {
+      await db.update('settings', {'daily_targets': encoded}, where: 'id = 1');
+    }
     _notifyChanged();
   }
 
@@ -674,34 +1261,44 @@ class AppDatabase {
     _notifyChanged();
   }
 
-  Future<Map<String, int>> dateOverrides() async {
+  Future<Map<String, int>> dateOverrides({required int accountId}) async {
     final db = await database;
-    final rows = await db.query('settings', columns: ['date_overrides']);
-    if (rows.isEmpty) return {};
-    final raw = rows.first['date_overrides'] as String? ?? '';
-    if (raw.isEmpty) return {};
+    final rows = await db.query(
+      'account_days',
+      columns: ['date', 'target_override'],
+      where: 'account_id = ? AND target_override IS NOT NULL',
+      whereArgs: [accountId],
+    );
     return {
-      for (final entry in raw.split(';'))
-        if (entry.contains('='))
-          entry.split('=')[0]: int.parse(entry.split('=')[1]),
+      for (final row in rows)
+        row['date'] as String: row['target_override'] as int,
     };
   }
 
-  Future<void> saveDateOverride(DateTime date, int? minutes) async {
-    final overrides = await dateOverrides();
-    if (minutes == null) {
-      overrides.remove(dateKey(date));
-    } else {
-      if (minutes < 0 || minutes > 1440) {
-        throw ArgumentError('El objetivo debe estar entre 0 y 24 horas.');
-      }
-      overrides[dateKey(date)] = minutes;
+  Future<void> saveDateOverride(
+    DateTime date,
+    int? minutes, {
+    required int accountId,
+  }) async {
+    if (minutes != null && (minutes < 0 || minutes > 1440)) {
+      throw ArgumentError('El objetivo debe estar entre 0 y 24 horas.');
     }
-    final encoded = overrides.entries
-        .map((entry) => '${entry.key}=${entry.value}')
-        .join(';');
     final db = await database;
-    await db.update('settings', {'date_overrides': encoded}, where: 'id = 1');
+    final key = dateKey(date);
+    final current = await db.query(
+      'account_days',
+      where: 'date = ? AND account_id = ?',
+      whereArgs: [key, accountId],
+      limit: 1,
+    );
+    if (minutes == null && current.isEmpty) return;
+    await db.insert('account_days', {
+      'date': key,
+      'account_id': accountId,
+      'kind': current.isEmpty ? 'work' : current.first['kind'] ?? 'work',
+      'note': current.isEmpty ? '' : current.first['note'] ?? '',
+      'target_override': minutes,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
     _notifyChanged();
   }
 
@@ -727,11 +1324,27 @@ class AppDatabase {
     _notifyChanged();
   }
 
-  Future<void> saveDayKind(DateTime date, DayKind kind) async {
+  Future<void> saveDayKind(
+    DateTime date,
+    DayKind kind, {
+    required int accountId,
+  }) async {
     final db = await database;
-    await db.insert('days', {
-      'date': dateKey(date),
+    final key = dateKey(date);
+    final current = await db.query(
+      'account_days',
+      where: 'date = ? AND account_id = ?',
+      whereArgs: [key, accountId],
+      limit: 1,
+    );
+    await db.insert('account_days', {
+      'date': key,
+      'account_id': accountId,
       'kind': kind.name,
+      'note': current.isEmpty ? '' : current.first['note'] ?? '',
+      'target_override': current.isEmpty
+          ? null
+          : current.first['target_override'],
     }, conflictAlgorithm: ConflictAlgorithm.replace);
     _notifyChanged();
   }

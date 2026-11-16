@@ -18,10 +18,10 @@ class _SummaryScreenState extends State<SummaryScreen> {
   DateTime _anchor = DateTime.now();
   bool _loading = true;
   List<WorkMovement> _movements = [];
-  List<Map<String, Object?>> _accounts = [];
-  List<int> _targets = [480, 480, 480, 480, 480, 0, 0];
+  Map<int, List<int>> _accountTargets = {};
   Map<String, DayKind> _kinds = {};
   Map<String, int> _overrides = {};
+  Map<String, int> _medicalMinutes = {};
   int _weekStartDay = 1;
 
   DateTime get _from {
@@ -46,32 +46,41 @@ class _SummaryScreenState extends State<SummaryScreen> {
     }
   }
 
-  int get _worked => sumWorked(_movements);
+  int get _worked => sumWorked(_movements) + _medicalTotal;
+  int get _medicalTotal => _medicalMinutes.entries.fold<int>(
+    0,
+    (sum, entry) => (_kinds[entry.key] ?? DayKind.work) == DayKind.work
+        ? sum + entry.value
+        : sum,
+  );
+  int get _medicalRecordedTotal =>
+      _medicalMinutes.values.fold<int>(0, (sum, minutes) => sum + minutes);
   int get _registeredDays =>
       _movements.map((movement) => movement.date).toSet().length;
 
-  List<Map<String, Object?>> get _accountTotals =>
-      _accounts
-          .map(
-            (account) => {
-              'account': account,
-              'minutes': _accountTotal(account['id'] as int),
-            },
-          )
-          .where((item) => item['minutes'] != 0)
-          .toList()
-        ..sort((a, b) => (b['minutes'] as int).compareTo(a['minutes'] as int));
-
-  int get _maxAccountMinutes => _accountTotals.fold<int>(
-    1,
-    (max, item) =>
-        (item['minutes'] as int) > max ? item['minutes'] as int : max,
-  );
+  int _daysOfKind(DayKind kind) {
+    var count = 0;
+    for (
+      var date = _from;
+      !date.isAfter(_to);
+      date = date.add(const Duration(days: 1))
+    ) {
+      if ((_kinds[dateKey(date)] ?? DayKind.work) == kind) count++;
+    }
+    return count;
+  }
 
   int _targetFor(DateTime date) {
     if ((_kinds[dateKey(date)] ?? DayKind.work) != DayKind.work) return 0;
-    return _overrides[dateKey(date)] ?? dailyTarget(date, _targets);
+    return _scheduledTargetFor(date);
   }
+
+  int _scheduledTargetFor(DateTime date) =>
+      _overrides[dateKey(date)] ??
+      _accountTargets.values.fold<int>(
+        0,
+        (total, targets) => total + dailyTarget(date, targets),
+      );
 
   int get _target {
     var sum = 0;
@@ -107,7 +116,18 @@ class _SummaryScreenState extends State<SummaryScreen> {
       ) {
         weekTarget += _targetFor(date);
       }
-      extra += (sumWorked(weekMovements) - weekTarget).clamp(0, 1 << 30);
+      final weekMedical = _medicalMinutes.entries
+          .where(
+            (entry) =>
+                (_kinds[entry.key] ?? DayKind.work) == DayKind.work &&
+                !DateTime.parse(entry.key).isBefore(from) &&
+                !DateTime.parse(entry.key).isAfter(to),
+          )
+          .fold<int>(0, (sum, entry) => sum + entry.value);
+      extra += (sumWorked(weekMovements) + weekMedical - weekTarget).clamp(
+        0,
+        1 << 30,
+      );
       weekStart = weekStart.add(const Duration(days: 7));
     }
     return extra;
@@ -134,20 +154,21 @@ class _SummaryScreenState extends State<SummaryScreen> {
     setState(() => _loading = true);
     try {
       _weekStartDay = await _database.weekStart();
+      final activeAccountId = await _database.activeAccountId();
       final results = await Future.wait<Object>([
-        _database.movementsBetween(_from, _to),
-        _database.dayKindsBetween(_from, _to),
-        _database.dailyTargets(),
-        _database.allAccounts(),
-        _database.dateOverrides(),
+        _database.movementsBetween(_from, _to, accountId: activeAccountId),
+        _database.dayKindsBetween(_from, _to, accountId: activeAccountId),
+        _database.dailyTargets(accountId: activeAccountId),
+        _database.dateOverrides(accountId: activeAccountId),
+        _database.medicalMinutesBetween(_from, _to, accountId: activeAccountId),
       ]);
       if (!mounted) return;
       setState(() {
         _movements = results[0] as List<WorkMovement>;
         _kinds = results[1] as Map<String, DayKind>;
-        _targets = results[2] as List<int>;
-        _accounts = results[3] as List<Map<String, Object?>>;
-        _overrides = results[4] as Map<String, int>;
+        _accountTargets = {activeAccountId: results[2] as List<int>};
+        _overrides = results[3] as Map<String, int>;
+        _medicalMinutes = results[4] as Map<String, int>;
         _loading = false;
       });
     } catch (_) {
@@ -169,11 +190,15 @@ class _SummaryScreenState extends State<SummaryScreen> {
     _load();
   }
 
-  int _accountTotal(int id) =>
-      sumWorked(_movements.where((movement) => movement.accountId == id));
-
   int _dayWorked(DateTime date) =>
       sumWorked(_movements.where((movement) => movement.date == dateKey(date)));
+
+  int _dayMedical(DateTime date) =>
+      (_kinds[dateKey(date)] ?? DayKind.work) == DayKind.work
+      ? _medicalMinutes[dateKey(date)] ?? 0
+      : 0;
+
+  int _dayCredited(DateTime date) => _dayWorked(date) + _dayMedical(date);
 
   Map<DayKind, int> _excusedBetween(DateTime from, DateTime to) {
     final totals = {for (final kind in DayKind.values) kind: 0};
@@ -184,9 +209,7 @@ class _SummaryScreenState extends State<SummaryScreen> {
     ) {
       final kind = _kinds[dateKey(date)] ?? DayKind.work;
       if (kind != DayKind.work) {
-        totals[kind] =
-            totals[kind]! +
-            (_overrides[dateKey(date)] ?? dailyTarget(date, _targets));
+        totals[kind] = totals[kind]! + _scheduledTargetFor(date);
       }
     }
     return totals;
@@ -219,12 +242,21 @@ class _SummaryScreenState extends State<SummaryScreen> {
       final from = week.isBefore(_from) ? _from : week;
       final weekEnd = week.add(const Duration(days: 6));
       final to = weekEnd.isAfter(_to) ? _to : weekEnd;
-      final worked = sumWorked(
-        _movements.where((movement) {
-          final date = DateTime.parse(movement.date);
-          return !date.isBefore(from) && !date.isAfter(to);
-        }),
-      );
+      final worked =
+          sumWorked(
+            _movements.where((movement) {
+              final date = DateTime.parse(movement.date);
+              return !date.isBefore(from) && !date.isAfter(to);
+            }),
+          ) +
+          _medicalMinutes.entries
+              .where(
+                (entry) =>
+                    (_kinds[entry.key] ?? DayKind.work) == DayKind.work &&
+                    !DateTime.parse(entry.key).isBefore(from) &&
+                    !DateTime.parse(entry.key).isAfter(to),
+              )
+              .fold<int>(0, (sum, entry) => sum + entry.value);
       var target = 0;
       for (
         var date = from;
@@ -251,12 +283,21 @@ class _SummaryScreenState extends State<SummaryScreen> {
     return List.generate(12, (index) {
       final from = DateTime(_anchor.year, index + 1);
       final to = DateTime(_anchor.year, index + 2, 0);
-      final worked = sumWorked(
-        _movements.where((movement) {
-          final date = DateTime.parse(movement.date);
-          return !date.isBefore(from) && !date.isAfter(to);
-        }),
-      );
+      final worked =
+          sumWorked(
+            _movements.where((movement) {
+              final date = DateTime.parse(movement.date);
+              return !date.isBefore(from) && !date.isAfter(to);
+            }),
+          ) +
+          _medicalMinutes.entries
+              .where(
+                (entry) =>
+                    (_kinds[entry.key] ?? DayKind.work) == DayKind.work &&
+                    !DateTime.parse(entry.key).isBefore(from) &&
+                    !DateTime.parse(entry.key).isAfter(to),
+              )
+              .fold<int>(0, (sum, entry) => sum + entry.value);
       var target = 0;
       for (
         var date = from;
@@ -316,10 +357,10 @@ class _SummaryScreenState extends State<SummaryScreen> {
                   _weeklyBreakdown(),
                   const SizedBox(height: 20),
                 ],
-                _accountBreakdown(),
-                const SizedBox(height: 16),
                 if (_range == _SummaryRange.month) _monthlyBreakdown(),
                 if (_range == _SummaryRange.year) _yearlyBreakdown(),
+                const SizedBox(height: 12),
+                _summaryTiles(),
                 if (_range != _SummaryRange.week) ...[
                   const SizedBox(height: 12),
                   _infoBanner(
@@ -547,6 +588,107 @@ class _SummaryScreenState extends State<SummaryScreen> {
     ],
   );
 
+  Widget _summaryTiles() => Column(
+    children: [
+      Row(
+        children: [
+          Expanded(
+            child: _summaryTile(
+              'Vacaciones',
+              '${_daysOfKind(DayKind.vacation)} días',
+              const Color(0xff8c6bd9),
+              Icons.beach_access_rounded,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _summaryTile(
+              'Asunto propio',
+              '${_daysOfKind(DayKind.personal)} días',
+              const Color(0xffd59639),
+              Icons.event_available_rounded,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 10),
+      Row(
+        children: [
+          Expanded(
+            child: _summaryTile(
+              'Tiempo médico',
+              formatMinutes(_medicalRecordedTotal),
+              const Color(0xff5687d9),
+              Icons.medical_services_rounded,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _summaryTile(
+              'Baja',
+              '${_daysOfKind(DayKind.sick)} días',
+              const Color(0xffed7891),
+              Icons.health_and_safety_rounded,
+            ),
+          ),
+        ],
+      ),
+    ],
+  );
+
+  Widget _summaryTile(String label, String value, Color color, IconData icon) =>
+      AspectRatio(
+        aspectRatio: 1.4,
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: const Color(0xffe8ebf1)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: color, size: 17),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    value,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800,
+                      color: Color(0xff263047),
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    label,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: Color(0xff8993a5),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+
   Widget _statCard(String label, String value, String note) => Card(
     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
     child: Padding(
@@ -585,16 +727,21 @@ class _SummaryScreenState extends State<SummaryScreen> {
       final kind = _kinds[dateKey(date)] ?? DayKind.work;
       return kind == DayKind.work
           ? _targetFor(date)
-          : (_overrides[dateKey(date)] ?? dailyTarget(date, _targets));
+          : _scheduledTargetFor(date);
     }).fold<int>(1, (value, day) => day > value ? day : value);
     final maxExtraRatio = List.generate(7, (index) {
       final date = _from.add(Duration(days: index));
+      final kind = _kinds[dateKey(date)] ?? DayKind.work;
       final target = _targetFor(date);
+      final medical = kind == DayKind.work
+          ? _medicalMinutes[dateKey(date)] ?? 0
+          : 0;
       final worked = _dayWorked(date);
-      return (worked - target).clamp(0, 1 << 30) /
+      final credited = worked + medical;
+      return (credited - target).clamp(0, 1 << 30) /
           (target == 0 ? maxScheduled : target);
     }).fold<double>(0, (value, ratio) => ratio > value ? ratio : value);
-    final trackWidth = 100 / (1 + maxExtraRatio);
+    final trackScale = 1 / (1 + maxExtraRatio);
     return _breakdownCard(
       title: 'Días de la semana',
       subtitle: '${_weekday(_from.weekday)} a ${_weekday(_to.weekday)}',
@@ -602,6 +749,8 @@ class _SummaryScreenState extends State<SummaryScreen> {
         _legend('Hasta objetivo', const Color(0xff3978f6)),
         _legend('Exceso diario', const Color(0xffffa726)),
         _legend('Vacaciones', const Color(0xff8c6bd9)),
+        _legend('Asunto propio', const Color(0xffd59639)),
+        _legend('Médico', const Color(0xff5687d9)),
         _legend('Baja', const Color(0xffed7891)),
         _legend('Festivo', const Color(0xff3eaf9b)),
       ],
@@ -609,50 +758,73 @@ class _SummaryScreenState extends State<SummaryScreen> {
         for (var index = 0; index < 7; index++)
           _dayBreakdownRow(
             _from.add(Duration(days: index)),
-            trackWidth,
+            trackScale,
             maxScheduled,
           ),
       ],
     );
   }
 
-  Widget _dayBreakdownRow(DateTime date, double trackWidth, int maxScheduled) {
+  Widget _dayBreakdownRow(DateTime date, double trackScale, int maxScheduled) {
     final worked = _dayWorked(date);
     final target = _targetFor(date);
     final kind = _kinds[dateKey(date)] ?? DayKind.work;
-    final scheduled = kind == DayKind.work
-        ? target
-        : (_overrides[dateKey(date)] ?? dailyTarget(date, _targets));
-    final denominator = target + (kind == DayKind.work ? 0 : scheduled);
+    final scheduled = kind == DayKind.work ? target : _scheduledTargetFor(date);
+    final medical = kind == DayKind.work
+        ? _medicalMinutes[dateKey(date)] ?? 0
+        : 0;
+    final denominator = kind == DayKind.work ? target : scheduled;
     final denominatorSafe = denominator == 0 ? maxScheduled : denominator;
-    final workedTargetWidth =
-        (worked.clamp(0, target) / denominatorSafe) * trackWidth;
-    final excessWidth =
-        (worked > target
-                ? ((worked - target) / denominatorSafe) * trackWidth
-                : 0.0)
-            .clamp(0.0, 100.0);
-    final excusedWidth = kind == DayKind.work
-        ? 0.0
-        : (scheduled / denominatorSafe) * trackWidth;
-    final bar = Container(
-      height: 8,
-      width: trackWidth,
-      decoration: BoxDecoration(
-        color: const Color(0xffedf0f5),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Row(
-        children: [
-          if (kind == DayKind.work) ...[
-            Container(width: workedTargetWidth, color: const Color(0xff3978f6)),
-            if (excessWidth > 0)
-              Container(width: excessWidth, color: const Color(0xffffa726)),
-          ] else
-            Container(width: excusedWidth, color: _kindColor(kind)),
-        ],
-      ),
+    final bar = LayoutBuilder(
+      builder: (context, constraints) {
+        final goalTrackWidth = constraints.maxWidth * trackScale;
+        final requiredWork = (target - medical).clamp(0, target);
+        final workedTargetWidth =
+            (worked.clamp(0, requiredWork) / denominatorSafe) * goalTrackWidth;
+        final medicalWidth = (medical / denominatorSafe) * goalTrackWidth;
+        final excessWorked = worked - requiredWork;
+        final excessWidth = excessWorked > 0
+            ? (excessWorked / denominatorSafe) * goalTrackWidth
+            : 0.0;
+        final excusedWidth = kind == DayKind.work
+            ? 0.0
+            : (scheduled / denominatorSafe) * goalTrackWidth;
+        return Row(
+          children: [
+            Container(
+              width: goalTrackWidth,
+              height: 8,
+              decoration: BoxDecoration(
+                color: const Color(0xffedf0f5),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: Row(
+                children: [
+                  if (kind == DayKind.work) ...[
+                    Container(
+                      width: workedTargetWidth,
+                      color: const Color(0xff3978f6),
+                    ),
+                    if (medicalWidth > 0)
+                      Container(
+                        width: medicalWidth,
+                        color: _kindColor(DayKind.medical),
+                      ),
+                  ] else
+                    Container(width: excusedWidth, color: _kindColor(kind)),
+                ],
+              ),
+            ),
+            if (kind == DayKind.work && excessWidth > 0)
+              Container(
+                width: excessWidth,
+                height: 8,
+                color: const Color(0xffffa726),
+              ),
+          ],
+        );
+      },
     );
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -674,79 +846,7 @@ class _SummaryScreenState extends State<SummaryScreen> {
           SizedBox(
             width: 54,
             child: Text(
-              formatMinutes(worked),
-              textAlign: TextAlign.right,
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _accountBreakdown() {
-    final totals = _accountTotals;
-    return _breakdownCard(
-      title: 'Por cuenta',
-      subtitle: 'Horas del periodo seleccionado',
-      rows: totals.isEmpty
-          ? [
-              const Padding(
-                padding: EdgeInsets.all(16),
-                child: Text(
-                  'No hay horas registradas en este periodo.',
-                  style: TextStyle(color: Color(0xff8993a5)),
-                ),
-              ),
-            ]
-          : [
-              for (final item in totals)
-                _accountBreakdownRow(
-                  item['account'] as Map<String, Object?>,
-                  item['minutes'] as int,
-                ),
-            ],
-    );
-  }
-
-  Widget _accountBreakdownRow(Map<String, Object?> account, int minutes) {
-    final color = Color(account['color'] as int);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      child: Row(
-        children: [
-          Container(
-            width: 9,
-            height: 9,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 9),
-          SizedBox(
-            width: 92,
-            child: Text(
-              '${account['name']}${account['archived'] == 1 ? ' ·' : ''}',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: LinearProgressIndicator(
-                value: minutes / _maxAccountMinutes,
-                minHeight: 6,
-                backgroundColor: const Color(0xffedf0f5),
-                valueColor: AlwaysStoppedAnimation<Color>(color),
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 54,
-            child: Text(
-              formatMinutes(minutes),
+              formatMinutes(_dayCredited(date)),
               textAlign: TextAlign.right,
               style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
             ),
@@ -776,6 +876,8 @@ class _SummaryScreenState extends State<SummaryScreen> {
       legend: [
         _legend('Trabajadas', const Color(0xff3978f6)),
         _legend('Vacaciones', const Color(0xff8c6bd9)),
+        _legend('Asunto propio', const Color(0xffd59639)),
+        _legend('Médico', const Color(0xff5687d9)),
         _legend('Baja', const Color(0xffed7891)),
         _legend('Festivo', const Color(0xff3eaf9b)),
       ],
@@ -810,6 +912,8 @@ class _SummaryScreenState extends State<SummaryScreen> {
       legend: [
         _legend('Trabajadas', const Color(0xff3978f6)),
         _legend('Vacaciones', const Color(0xff8c6bd9)),
+        _legend('Asunto propio', const Color(0xffd59639)),
+        _legend('Médico', const Color(0xff5687d9)),
         _legend('Baja', const Color(0xffed7891)),
         _legend('Festivo', const Color(0xff3eaf9b)),
       ],
@@ -862,6 +966,8 @@ class _SummaryScreenState extends State<SummaryScreen> {
                         ),
                       for (final kind in [
                         DayKind.vacation,
+                        DayKind.personal,
+                        DayKind.medical,
                         DayKind.sick,
                         DayKind.holiday,
                       ])
@@ -968,6 +1074,8 @@ class _SummaryScreenState extends State<SummaryScreen> {
 
   Color _kindColor(DayKind kind) => switch (kind) {
     DayKind.vacation => const Color(0xff8c6bd9),
+    DayKind.personal => const Color(0xffd59639),
+    DayKind.medical => const Color(0xff5687d9),
     DayKind.sick => const Color(0xffed7891),
     DayKind.holiday => const Color(0xff3eaf9b),
     DayKind.work => const Color(0xff3978f6),

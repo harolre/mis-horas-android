@@ -37,4 +37,22 @@ void main() {
     final monday = DateTime(2026, 11, 16);
     expect(weeklyTarget(monday, [480, 480, 480, 480, 480, 0, 0]), 2400);
   });
+
+  group('tiempo médico', () {
+    test('reduce el objetivo sin cambiar las horas trabajadas', () {
+      expect(targetAfterMedical(480, 60), 420);
+    });
+
+    test(
+      'el tiempo médico no puede reducir el objetivo por debajo de cero',
+      () {
+        expect(targetAfterMedical(480, 600), 0);
+      },
+    );
+
+    test('asunto propio y médico son estados de día reconocidos', () {
+      expect(DayKind.personal.label, 'Asunto propio');
+      expect(DayKind.medical.label, 'Médico');
+    });
+  });
 }

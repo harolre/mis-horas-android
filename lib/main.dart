@@ -64,53 +64,49 @@ class _AppShellState extends State<_AppShell> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        body: IndexedStack(
-          index: _selectedTab,
-          children: [
-            HomeScreen(key: _homeKey),
-            SummaryScreen(),
-            CalendarScreen(
-              onSelectDate: (date) {
-                _homeKey.currentState?._selectDate(date);
-                setState(() => _selectedTab = 0);
-              },
-            ),
-            AccountsScreen(),
-            SettingsScreen(),
-          ],
+    body: IndexedStack(
+      index: _selectedTab,
+      children: [
+        HomeScreen(key: _homeKey),
+        SummaryScreen(),
+        CalendarScreen(
+          onSelectDate: (date) {
+            _homeKey.currentState?._selectDate(date);
+            setState(() => _selectedTab = 0);
+          },
         ),
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: _selectedTab,
-          onDestinationSelected: (index) =>
-              setState(() => _selectedTab = index),
-          destinations: const [
-            NavigationDestination(
-              icon: Icon(Icons.home_outlined),
-              selectedIcon: Icon(Icons.home_rounded),
-              label: 'Inicio',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.bar_chart_outlined),
-              selectedIcon: Icon(Icons.bar_chart_rounded),
-              label: 'Resumen',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.calendar_month_outlined),
-              selectedIcon: Icon(Icons.calendar_month_rounded),
-              label: 'Calendario',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.account_balance_wallet_outlined),
-              selectedIcon: Icon(Icons.account_balance_wallet_rounded),
-              label: 'Cuentas',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.tune_rounded),
-              label: 'Ajustes',
-            ),
-          ],
+        AccountsScreen(),
+        SettingsScreen(),
+      ],
+    ),
+    bottomNavigationBar: NavigationBar(
+      selectedIndex: _selectedTab,
+      onDestinationSelected: (index) => setState(() => _selectedTab = index),
+      destinations: const [
+        NavigationDestination(
+          icon: Icon(Icons.home_outlined),
+          selectedIcon: Icon(Icons.home_rounded),
+          label: 'Inicio',
         ),
-      );
+        NavigationDestination(
+          icon: Icon(Icons.bar_chart_outlined),
+          selectedIcon: Icon(Icons.bar_chart_rounded),
+          label: 'Resumen',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.calendar_month_outlined),
+          selectedIcon: Icon(Icons.calendar_month_rounded),
+          label: 'Calendario',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.account_balance_wallet_outlined),
+          selectedIcon: Icon(Icons.account_balance_wallet_rounded),
+          label: 'Cuentas',
+        ),
+        NavigationDestination(icon: Icon(Icons.tune_rounded), label: 'Ajustes'),
+      ],
+    ),
+  );
 }
 
 class HomeScreen extends StatefulWidget {
@@ -129,8 +125,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Map<String, DayKind> _dayKinds = {};
   Map<String, int> _dateOverrides = {};
   Map<String, String> _dayNotes = {};
+  Map<String, int> _medicalMinutes = {};
   List<Map<String, Object?>> _attachments = [];
   int _weekStartDay = 1;
+  int? _activeAccountId;
   bool _loading = true;
   String? _error;
 
@@ -138,13 +136,42 @@ class _HomeScreenState extends State<HomeScreen> {
   DateTime get _weekEnd => _weekStart.add(const Duration(days: 6));
   String get _selectedKey => dateKey(_selectedDate);
   DayKind get _selectedKind => _dayKinds[_selectedKey] ?? DayKind.work;
-  List<WorkMovement> get _selectedMovements =>
-      _movements.where((movement) => movement.date == _selectedKey).toList();
+  Map<String, Object?>? get _activeAccount {
+    for (final account in _accounts) {
+      if (account['id'] == _activeAccountId) return account;
+    }
+    return null;
+  }
+
+  String get _selectedKindDescription => switch (_selectedKind) {
+    DayKind.work => 'Jornada y tramos registrados',
+    DayKind.vacation => 'Día de vacaciones',
+    DayKind.personal => 'Día de asunto propio',
+    DayKind.medical => 'Día médico',
+    DayKind.holiday => 'Día festivo',
+    DayKind.sick => 'Día de baja',
+  };
+  List<WorkMovement> get _selectedMovements => _movements
+      .where(
+        (movement) =>
+            movement.date == _selectedKey &&
+            movement.accountId == _activeAccountId,
+      )
+      .toList();
   int get _selectedWorked => sumWorked(_selectedMovements);
+  int get _selectedMedicalMinutes => _medicalMinutes[_selectedKey] ?? 0;
   int get _selectedTarget => _selectedKind == DayKind.work
-      ? (_dateOverrides[_selectedKey] ?? dailyTarget(_selectedDate, _targets))
+      ? _dateOverrides[_selectedKey] ?? dailyTarget(_selectedDate, _targets)
       : 0;
-  int get _weekWorked => sumWorked(_movements);
+  int get _weekWorked =>
+      sumWorked(
+        _movements.where((movement) => movement.accountId == _activeAccountId),
+      ) +
+      _medicalMinutes.entries
+          .where(
+            (entry) => (_dayKinds[entry.key] ?? DayKind.work) == DayKind.work,
+          )
+          .fold<int>(0, (sum, entry) => sum + entry.value);
   int get _weekGoal {
     var goal = 0;
     for (var index = 0; index < 7; index++) {
@@ -180,15 +207,29 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     try {
       final weekStartDay = await _database.weekStart();
+      final activeAccountId = await _database.activeAccountId();
       final start = startOfWeek(_selectedDate, weekStartDay);
       final results = await Future.wait<Object>([
         _database.movementsBetween(start, start.add(const Duration(days: 6))),
-        _database.dayKindsBetween(start, start.add(const Duration(days: 6))),
-        _database.dailyTargets(),
+        _database.dayKindsBetween(
+          start,
+          start.add(const Duration(days: 6)),
+          accountId: activeAccountId,
+        ),
+        _database.dailyTargets(accountId: activeAccountId),
         _database.accounts(),
-        _database.dateOverrides(),
-        _database.dayNotesBetween(start, start.add(const Duration(days: 6))),
-        _database.attachmentsForDate(_selectedDate),
+        _database.dateOverrides(accountId: activeAccountId),
+        _database.dayNotesBetween(
+          start,
+          start.add(const Duration(days: 6)),
+          accountId: activeAccountId,
+        ),
+        _database.attachmentsForDate(_selectedDate, accountId: activeAccountId),
+        _database.medicalMinutesBetween(
+          start,
+          start.add(const Duration(days: 6)),
+          accountId: activeAccountId,
+        ),
       ]);
       if (!mounted) return;
       setState(() {
@@ -199,7 +240,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _dateOverrides = results[4] as Map<String, int>;
         _dayNotes = results[5] as Map<String, String>;
         _attachments = results[6] as List<Map<String, Object?>>;
+        _medicalMinutes = results[7] as Map<String, int>;
         _weekStartDay = weekStartDay;
+        _activeAccountId = activeAccountId;
         _loading = false;
       });
     } catch (error) {
@@ -212,7 +255,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _changeWeek(int amount) {
-    setState(() => _selectedDate = _selectedDate.add(Duration(days: amount * 7)));
+    setState(
+      () => _selectedDate = _selectedDate.add(Duration(days: amount * 7)),
+    );
     _reload();
   }
 
@@ -222,41 +267,40 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _changeDayKind(DayKind kind) async {
-    await _database.saveDayKind(_selectedDate, kind);
+    final accountId = _activeAccountId;
+    if (accountId == null) return;
+    await _database.saveDayKind(_selectedDate, kind, accountId: accountId);
+  }
+
+  Future<void> _editMedicalTime() async {
+    if (_activeAccountId == null) return;
+    final minutes = await showDialog<int>(
+      context: context,
+      builder: (context) =>
+          _MedicalTimeDialog(initialMinutes: _selectedMedicalMinutes),
+    );
+    if (minutes == null) return;
+    try {
+      await _database.saveMedicalMinutes(
+        date: _selectedDate,
+        accountId: _activeAccountId!,
+        minutes: minutes,
+      );
+    } catch (error) {
+      _message('No se pudo guardar el tiempo médico: $error');
+    }
   }
 
   Future<void> _editNote() async {
-    final controller = TextEditingController(text: _dayNotes[_selectedKey] ?? '');
     final note = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Nota del día'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          maxLength: 1000,
-          minLines: 3,
-          maxLines: 6,
-          textCapitalization: TextCapitalization.sentences,
-          decoration: const InputDecoration(
-            hintText: 'Añade un detalle sobre esta jornada…',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Guardar'),
-          ),
-        ],
-      ),
+      builder: (context) =>
+          _DayNoteDialog(initialNote: _dayNotes[_selectedKey] ?? ''),
     );
-    controller.dispose();
-    if (note != null) await _database.saveDayNote(_selectedDate, note);
+    final accountId = _activeAccountId;
+    if (note != null && accountId != null) {
+      await _database.saveDayNote(_selectedDate, note, accountId: accountId);
+    }
   }
 
   Future<void> _addAttachments() async {
@@ -296,6 +340,7 @@ class _HomeScreenState extends State<HomeScreen> {
         };
         await _database.addAttachment(
           date: attachmentDate,
+          accountId: _activeAccountId!,
           name: photo.name,
           mime: mime,
           bytes: photo.openRead(),
@@ -306,7 +351,13 @@ class _HomeScreenState extends State<HomeScreen> {
       final result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: [
-          'jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf',
+          'jpg',
+          'jpeg',
+          'png',
+          'webp',
+          'heic',
+          'heif',
+          'pdf',
         ],
       );
       if (result.isEmpty) return;
@@ -324,6 +375,7 @@ class _HomeScreenState extends State<HomeScreen> {
         };
         await _database.addAttachment(
           date: attachmentDate,
+          accountId: _activeAccountId!,
           name: file.name,
           mime: mime,
           bytes: file.readAsByteStream(),
@@ -407,13 +459,29 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (context) => MovementDialog(
         date: _selectedDate,
-        accounts: _accounts,
+        accountId: movement?.accountId ?? _activeAccountId!,
+        accountName:
+            _accounts.firstWhere(
+                  (account) =>
+                      account['id'] ==
+                      (movement?.accountId ?? _activeAccountId),
+                )['name']
+                as String,
+        accountColor: Color(
+          _accounts.firstWhere(
+                (account) =>
+                    account['id'] == (movement?.accountId ?? _activeAccountId),
+              )['color']
+              as int,
+        ),
         movement: movement,
       ),
     );
     if (result == null) return;
     final overlaps = _movements.any((current) {
-      if (current.id == movement?.id || current.date != result.date) return false;
+      if (current.id == movement?.id || current.date != result.date) {
+        return false;
+      }
       final currentEnd =
           current.endMinute + (current.crossesMidnight ? 1440 : 0);
       final newEnd = result.endMinute + (result.crossesMidnight ? 1440 : 0);
@@ -471,7 +539,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 color: const Color(0xffe8efff),
                 borderRadius: BorderRadius.circular(13),
               ),
-              child: const Icon(Icons.schedule_rounded, color: Color(0xff3978f6)),
+              child: const Icon(
+                Icons.schedule_rounded,
+                color: Color(0xff3978f6),
+              ),
             ),
             const SizedBox(width: 11),
             const Column(
@@ -504,90 +575,129 @@ class _HomeScreenState extends State<HomeScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : _error != null
-              ? _ErrorView(message: _error!, onRetry: _reload)
-              : RefreshIndicator(
-                  onRefresh: _reload,
-                  child: ListView(
-                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 112),
-                    children: [
-                      _weekHeader(),
-                      const SizedBox(height: 17),
-                      _weekCard(weeklyGoal, weeklyExtra),
-                      const SizedBox(height: 23),
-                      _weekDays(),
-                      const SizedBox(height: 25),
-                      _dayHeading(),
-                      const SizedBox(height: 13),
-                      _daySummary(),
-                      const SizedBox(height: 13),
-                      if (_selectedMovements.isEmpty)
-                        _emptyMovements()
-                      else
-                        ..._selectedMovements.map(_movementCard),
-                      const SizedBox(height: 16),
-                      if (_selectedKind == DayKind.work)
-                        FilledButton.icon(
-                          onPressed: () => _editMovement(),
-                          icon: const Icon(Icons.add_rounded),
-                          label: const Text('Añadir tramo'),
-                          style: FilledButton.styleFrom(
-                            minimumSize: const Size.fromHeight(54),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(17),
-                            ),
-                            textStyle: const TextStyle(
-                              fontWeight: FontWeight.w700,
-                              fontSize: 15,
-                            ),
-                          ),
+          ? _ErrorView(message: _error!, onRetry: _reload)
+          : RefreshIndicator(
+              onRefresh: _reload,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 112),
+                children: [
+                  _weekHeader(),
+                  const SizedBox(height: 10),
+                  _activeAccountBanner(),
+                  const SizedBox(height: 15),
+                  _weekCard(weeklyGoal, weeklyExtra),
+                  const SizedBox(height: 23),
+                  _weekDays(),
+                  const SizedBox(height: 25),
+                  _dayHeading(),
+                  const SizedBox(height: 13),
+                  _daySummary(),
+                  const SizedBox(height: 13),
+                  if (_selectedMovements.isEmpty)
+                    _emptyMovements()
+                  else
+                    ..._selectedMovements.map(_movementCard),
+                  const SizedBox(height: 16),
+                  if (_selectedKind == DayKind.work)
+                    FilledButton.icon(
+                      onPressed: () => _editMovement(),
+                      icon: const Icon(Icons.add_rounded),
+                      label: const Text('Añadir tramo'),
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size.fromHeight(54),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(17),
                         ),
-                      const SizedBox(height: 22),
-                      _noteCard(),
-                      const SizedBox(height: 18),
-                      _attachmentsSection(),
-                    ],
-                  ),
-                ),
+                        textStyle: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
+                      ),
+                    ),
+                  if (_selectedKind == DayKind.work ||
+                      _selectedMedicalMinutes > 0) ...[
+                    const SizedBox(height: 12),
+                    _medicalTimeCard(),
+                  ],
+                  const SizedBox(height: 22),
+                  _noteCard(),
+                  const SizedBox(height: 18),
+                  _attachmentsSection(),
+                ],
+              ),
+            ),
     );
   }
 
   Widget _weekHeader() => Row(
+    children: [
+      IconButton.filledTonal(
+        onPressed: () => _changeWeek(-1),
+        icon: const Icon(Icons.chevron_left_rounded),
+        visualDensity: VisualDensity.compact,
+      ),
+      Expanded(
+        child: Column(
+          children: [
+            Text(
+              _weekLabel(),
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 2),
+            const Text(
+              'RESUMEN SEMANAL',
+              style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1.15,
+                fontWeight: FontWeight.w700,
+                color: Color(0xff8a94a6),
+              ),
+            ),
+          ],
+        ),
+      ),
+      IconButton.filledTonal(
+        onPressed: () => _changeWeek(1),
+        icon: const Icon(Icons.chevron_right_rounded),
+        visualDensity: VisualDensity.compact,
+      ),
+    ],
+  );
+
+  Widget _activeAccountBanner() {
+    final account = _activeAccount;
+    if (account == null) return const SizedBox.shrink();
+    final color = Color(account['color'] as int);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(15),
+      ),
+      child: Row(
         children: [
-          IconButton.filledTonal(
-            onPressed: () => _changeWeek(-1),
-            icon: const Icon(Icons.chevron_left_rounded),
-            visualDensity: VisualDensity.compact,
+          Icon(Icons.work_outline_rounded, color: color, size: 19),
+          const SizedBox(width: 9),
+          const Text(
+            'Cuenta activa:',
+            style: TextStyle(color: Color(0xff798397), fontSize: 12),
           ),
+          const SizedBox(width: 5),
           Expanded(
-            child: Column(
-              children: [
-                Text(
-                  _weekLabel(),
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                const Text(
-                  'RESUMEN SEMANAL',
-                  style: TextStyle(
-                    fontSize: 10,
-                    letterSpacing: 1.15,
-                    fontWeight: FontWeight.w700,
-                    color: Color(0xff8a94a6),
-                  ),
-                ),
-              ],
+            child: Text(
+              account['name'] as String,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
             ),
           ),
-          IconButton.filledTonal(
-            onPressed: () => _changeWeek(1),
-            icon: const Icon(Icons.chevron_right_rounded),
-            visualDensity: VisualDensity.compact,
+          const Text(
+            'Cámbiala en Cuentas',
+            style: TextStyle(color: Color(0xff8993a5), fontSize: 10),
           ),
         ],
-      );
+      ),
+    );
+  }
 
   Widget _weekCard(int goal, int extra) {
     final progress = goal == 0 ? 0.0 : (_weekWorked / goal).clamp(0.0, 1.0);
@@ -606,7 +716,7 @@ class _HomeScreenState extends State<HomeScreen> {
             color: Color(0x2218294a),
             blurRadius: 22,
             offset: Offset(0, 9),
-          )
+          ),
         ],
       ),
       child: Column(
@@ -620,8 +730,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   style: TextStyle(color: Color(0xffd2daea), fontSize: 13),
                 ),
               ),
-              const Icon(Icons.insights_rounded,
-                  color: Color(0xffa8c2ff), size: 20),
+              const Icon(
+                Icons.insights_rounded,
+                color: Color(0xffa8c2ff),
+                size: 20,
+              ),
             ],
           ),
           const SizedBox(height: 7),
@@ -655,8 +768,9 @@ class _HomeScreenState extends State<HomeScreen> {
               value: progress,
               minHeight: 8,
               backgroundColor: const Color(0xff425577),
-              valueColor:
-                  const AlwaysStoppedAnimation<Color>(Color(0xff87aaff)),
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                Color(0xff87aaff),
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -689,137 +803,151 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _weekDays() => Row(
-        children: List.generate(7, (index) {
-          final date = _weekStart.add(Duration(days: index));
-          final key = dateKey(date);
-          final isSelected = key == _selectedKey;
-          final kind = _dayKinds[key] ?? DayKind.work;
-          final worked = sumWorked(
-            _movements.where((movement) => movement.date == key),
-          );
-          final target = kind == DayKind.work ? dailyTarget(date, _targets) : 0;
-          return Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(right: index == 6 ? 0 : 6),
-              child: InkWell(
+    children: List.generate(7, (index) {
+      final date = _weekStart.add(Duration(days: index));
+      final key = dateKey(date);
+      final isSelected = key == _selectedKey;
+      final kind = _dayKinds[key] ?? DayKind.work;
+      final worked = sumWorked(
+        _movements.where(
+          (movement) =>
+              movement.date == key && movement.accountId == _activeAccountId,
+        ),
+      );
+      final target = kind == DayKind.work
+          ? _dateOverrides[key] ?? dailyTarget(date, _targets)
+          : 0;
+      return Expanded(
+        child: Padding(
+          padding: EdgeInsets.only(right: index == 6 ? 0 : 6),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(17),
+            onTap: () {
+              setState(() => _selectedDate = date);
+              _reload();
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(
+                color: isSelected ? const Color(0xff3978f6) : Colors.white,
                 borderRadius: BorderRadius.circular(17),
-                onTap: () {
-                  setState(() => _selectedDate = date);
-                  _reload();
-                },
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 160),
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xff3978f6) : Colors.white,
-                    borderRadius: BorderRadius.circular(17),
-                    border: Border.all(
+                border: Border.all(
+                  color: isSelected
+                      ? const Color(0xff3978f6)
+                      : const Color(0xffe8ebf1),
+                ),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    _weekdayShort(date.weekday),
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
                       color: isSelected
-                          ? const Color(0xff3978f6)
-                          : const Color(0xffe8ebf1),
+                          ? const Color(0xffdce7ff)
+                          : const Color(0xff8993a5),
                     ),
                   ),
-                  child: Column(
-                    children: [
-                      Text(
-                        _weekdayShort(date.weekday),
-                        style: TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          color: isSelected
-                              ? const Color(0xffdce7ff)
-                              : const Color(0xff8993a5),
-                        ),
-                      ),
-                      const SizedBox(height: 7),
-                      Text(
-                        '${date.day}',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w800,
-                          color: isSelected ? Colors.white : const Color(0xff243047),
-                        ),
-                      ),
-                      const SizedBox(height: 7),
-                      Container(
-                        width: 5,
-                        height: 5,
-                        decoration: BoxDecoration(
-                          color: worked > 0
-                              ? (isSelected ? Colors.white : const Color(0xff3978f6))
-                              : target > 0 && !isSelected
-                                  ? const Color(0xffdbe2ef)
-                                  : Colors.transparent,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                    ],
+                  const SizedBox(height: 7),
+                  Text(
+                    '${date.day}',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
+                      color: isSelected
+                          ? Colors.white
+                          : const Color(0xff243047),
+                    ),
                   ),
-                ),
-              ),
-            ),
-          );
-        }),
-      );
-
-  Widget _dayHeading() => Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _longDate(_selectedDate),
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.35,
+                  const SizedBox(height: 7),
+                  Container(
+                    width: 5,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: worked > 0
+                          ? (isSelected
+                                ? Colors.white
+                                : const Color(0xff3978f6))
+                          : target > 0 && !isSelected
+                          ? const Color(0xffdbe2ef)
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                    ),
                   ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  _selectedKind == DayKind.work
-                      ? 'Jornada y tramos registrados'
-                      : 'El objetivo de hoy está ajustado',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: Color(0xff8993a5),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          PopupMenuButton<DayKind>(
-            tooltip: 'Cambiar estado del día',
-            initialValue: _selectedKind,
-            onSelected: _changeDayKind,
-            itemBuilder: (context) => DayKind.values
-                .map(
-                  (kind) => PopupMenuItem(
-                    value: kind,
-                    child: Text('${kind.emoji}  ${kind.label}'),
-                  ),
-                )
-                .toList(),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: const Color(0xffe8ebf1)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(_selectedKind.emoji),
-                  const SizedBox(width: 6),
-                  const Icon(Icons.expand_more_rounded, size: 18),
                 ],
               ),
             ),
           ),
-        ],
+        ),
       );
+    }),
+  );
+
+  Widget _dayHeading() => Row(
+    children: [
+      Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _longDate(_selectedDate),
+              style: const TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -0.35,
+              ),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              _selectedKindDescription,
+              style: const TextStyle(fontSize: 12, color: Color(0xff8993a5)),
+            ),
+          ],
+        ),
+      ),
+      PopupMenuButton<DayKind>(
+        tooltip: 'Estado del día: ${_selectedKind.label}. Toca para cambiar',
+        initialValue: _selectedKind,
+        onSelected: _changeDayKind,
+        itemBuilder: (context) => DayKind.values
+            .where((kind) => kind != DayKind.medical)
+            .map(
+              (kind) => PopupMenuItem(
+                value: kind,
+                child: Text('${kind.emoji}  ${kind.label}'),
+              ),
+            )
+            .toList(),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: const Color(0xffe8ebf1)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_selectedKind.emoji),
+              const SizedBox(width: 6),
+              Text(
+                _selectedKind.label,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xff344054),
+                ),
+              ),
+              const SizedBox(width: 2),
+              const Icon(Icons.expand_more_rounded, size: 18),
+            ],
+          ),
+        ),
+      ),
+    ],
+  );
 
   Widget _daySummary() {
     final remaining = (_selectedTarget - _selectedWorked).clamp(0, 1 << 30);
@@ -860,41 +988,64 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _medicalTimeCard() => Card(
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+    child: ListTile(
+      leading: const Icon(
+        Icons.medical_services_outlined,
+        color: Color(0xffed7891),
+      ),
+      title: Text(
+        _selectedMedicalMinutes == 0
+            ? 'Tiempo médico'
+            : '${formatMinutes(_selectedMedicalMinutes)} de médico',
+        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+      ),
+      subtitle: Text(
+        _selectedMedicalMinutes == 0
+            ? 'Regístralo para justificar parte del objetivo.'
+            : 'Se computa como tiempo trabajado para completar tu jornada.',
+        style: const TextStyle(fontSize: 11),
+      ),
+      trailing: TextButton(
+        onPressed: _editMedicalTime,
+        child: Text(_selectedMedicalMinutes == 0 ? 'Añadir' : 'Editar'),
+      ),
+    ),
+  );
+
   Widget _emptyMovements() => Container(
-        padding: const EdgeInsets.symmetric(vertical: 25, horizontal: 20),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: const Color(0xffe8ebf1)),
+    padding: const EdgeInsets.symmetric(vertical: 25, horizontal: 20),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(20),
+      border: Border.all(color: const Color(0xffe8ebf1)),
+    ),
+    child: Column(
+      children: [
+        Container(
+          width: 48,
+          height: 48,
+          decoration: const BoxDecoration(
+            color: Color(0xffedf2ff),
+            shape: BoxShape.circle,
+          ),
+          child: const Icon(Icons.more_time_rounded, color: Color(0xff3978f6)),
         ),
-        child: Column(
-          children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: const BoxDecoration(
-                color: Color(0xffedf2ff),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.more_time_rounded,
-                color: Color(0xff3978f6),
-              ),
-            ),
-            const SizedBox(height: 11),
-            const Text(
-              'Aún no hay tramos',
-              style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-            ),
-            const SizedBox(height: 4),
-            const Text(
-              'Añade tu horario para llevar el seguimiento del día.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Color(0xff8993a5), fontSize: 12),
-            ),
-          ],
+        const SizedBox(height: 11),
+        const Text(
+          'Aún no hay tramos',
+          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
         ),
-      );
+        const SizedBox(height: 4),
+        const Text(
+          'Añade tu horario para llevar el seguimiento del día.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Color(0xff8993a5), fontSize: 12),
+        ),
+      ],
+    ),
+  );
 
   Widget _noteCard() {
     final note = _dayNotes[_selectedKey] ?? '';
@@ -903,8 +1054,10 @@ class _HomeScreenState extends State<HomeScreen> {
       child: ListTile(
         onTap: _editNote,
         leading: const Icon(Icons.notes_rounded, color: Color(0xff3978f6)),
-        title: const Text('Nota del día',
-            style: TextStyle(fontWeight: FontWeight.w700)),
+        title: const Text(
+          'Nota del día',
+          style: TextStyle(fontWeight: FontWeight.w700),
+        ),
         subtitle: Text(
           note.isEmpty ? 'Añade un comentario o recordatorio' : note,
           maxLines: note.isEmpty ? 1 : 2,
@@ -916,43 +1069,46 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _attachmentsSection() => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
         children: [
-          Row(
-            children: [
-              const Expanded(
-                child: Text('Adjuntos',
-                    style:
-                        TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
-              ),
-              Text('${_attachments.length}',
-                  style: const TextStyle(color: Color(0xff8993a5))),
-            ],
-          ),
-          const SizedBox(height: 9),
-          if (_attachments.isEmpty)
-            const Padding(
-              padding: EdgeInsets.only(bottom: 10),
-              child: Text(
-                'Guarda fotos o documentos asociados a este día.',
-                style: TextStyle(color: Color(0xff8993a5), fontSize: 12),
-              ),
-            )
-          else
-            ..._attachments.map(_attachmentCard),
-          OutlinedButton.icon(
-            onPressed: _addAttachments,
-            icon: const Icon(Icons.attach_file_rounded),
-            label: const Text('Añadir foto o PDF'),
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size.fromHeight(48),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(15),
-              ),
+          const Expanded(
+            child: Text(
+              'Adjuntos',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
             ),
           ),
+          Text(
+            '${_attachments.length}',
+            style: const TextStyle(color: Color(0xff8993a5)),
+          ),
         ],
-      );
+      ),
+      const SizedBox(height: 9),
+      if (_attachments.isEmpty)
+        Padding(
+          padding: EdgeInsets.only(bottom: 10),
+          child: Text(
+            'Guarda fotos o documentos de ${_activeAccount?['name'] ?? 'esta cuenta'} para este día.',
+            style: const TextStyle(color: Color(0xff8993a5), fontSize: 12),
+          ),
+        )
+      else
+        ..._attachments.map(_attachmentCard),
+      OutlinedButton.icon(
+        onPressed: _addAttachments,
+        icon: const Icon(Icons.attach_file_rounded),
+        label: const Text('Añadir foto o PDF'),
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size.fromHeight(48),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(15),
+          ),
+        ),
+      ),
+    ],
+  );
 
   Widget _attachmentCard(Map<String, Object?> attachment) {
     final mime = attachment['mime'] as String;
@@ -962,35 +1118,41 @@ class _HomeScreenState extends State<HomeScreen> {
       margin: const EdgeInsets.only(bottom: 8),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: ListTile(
-        onTap: () => isImage
-            ? _previewImage(attachment)
-            : _openAttachment(attachment),
+        onTap: () =>
+            isImage ? _previewImage(attachment) : _openAttachment(attachment),
         leading: isImage
             ? thumbnailPath == null
-                ? const CircleAvatar(
-                    backgroundColor: Color(0xffedf2ff),
-                    child: Icon(Icons.image_outlined, color: Color(0xff3978f6)),
-                  )
-                : ClipRRect(
-                borderRadius: BorderRadius.circular(9),
-                child: Image.file(
-                  File(thumbnailPath),
-                  width: 42,
-                  height: 42,
-                  fit: BoxFit.cover,
-                  errorBuilder: (context, error, stackTrace) =>
-                      const Icon(Icons.image_outlined),
-                ),
-              )
+                  ? const CircleAvatar(
+                      backgroundColor: Color(0xffedf2ff),
+                      child: Icon(
+                        Icons.image_outlined,
+                        color: Color(0xff3978f6),
+                      ),
+                    )
+                  : ClipRRect(
+                      borderRadius: BorderRadius.circular(9),
+                      child: Image.file(
+                        File(thumbnailPath),
+                        width: 42,
+                        height: 42,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) =>
+                            const Icon(Icons.image_outlined),
+                      ),
+                    )
             : const CircleAvatar(
                 backgroundColor: Color(0xffffeeee),
-                child: Icon(Icons.picture_as_pdf_rounded,
-                    color: Color(0xffd75252)),
+                child: Icon(
+                  Icons.picture_as_pdf_rounded,
+                  color: Color(0xffd75252),
+                ),
               ),
-        title: Text(attachment['name'] as String,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+        title: Text(
+          attachment['name'] as String,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+        ),
         subtitle: Text(
           '${((attachment['size'] as int) / 1024).toStringAsFixed(0)} KB',
           style: const TextStyle(fontSize: 11),
@@ -1028,8 +1190,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Row(
                   children: [
                     Expanded(
-                      child: Text(attachment['name'] as String,
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      child: Text(
+                        attachment['name'] as String,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     IconButton(
                       tooltip: 'Compartir',
@@ -1049,7 +1214,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   child: Image.file(
                     File(attachment['local_path'] as String),
                     fit: BoxFit.contain,
-                    cacheWidth: 2560,
+                    cacheWidth: 1600,
                     errorBuilder: (context, error, stackTrace) =>
                         const Center(child: Icon(Icons.broken_image_outlined)),
                   ),
@@ -1138,8 +1303,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String _weekLabel() {
     const months = [
-      'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
-      'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+      'enero',
+      'febrero',
+      'marzo',
+      'abril',
+      'mayo',
+      'junio',
+      'julio',
+      'agosto',
+      'septiembre',
+      'octubre',
+      'noviembre',
+      'diciembre',
     ];
     final start = _weekStart;
     final end = _weekEnd;
@@ -1166,25 +1341,29 @@ class _WeekMetric extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Row(
+    children: [
+      Icon(icon, color: accent, size: 18),
+      const SizedBox(width: 7),
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, color: accent, size: 18),
-          const SizedBox(width: 7),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(label,
-                  style: const TextStyle(
-                      color: Color(0xffc0cce0), fontSize: 10)),
-              const SizedBox(height: 2),
-              Text(value,
-                  style: TextStyle(
-                      color: accent,
-                      fontWeight: FontWeight.w800,
-                      fontSize: 13)),
-            ],
+          Text(
+            label,
+            style: const TextStyle(color: Color(0xffc0cce0), fontSize: 10),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: TextStyle(
+              color: accent,
+              fontWeight: FontWeight.w800,
+              fontSize: 13,
+            ),
           ),
         ],
-      );
+      ),
+    ],
+  );
 }
 
 class _SmallStat extends StatelessWidget {
@@ -1202,38 +1381,35 @@ class _SmallStat extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.fromLTRB(11, 12, 9, 12),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(17),
-          border: Border.all(color: const Color(0xffe8ebf1)),
+    padding: const EdgeInsets.fromLTRB(11, 12, 9, 12),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(17),
+      border: Border.all(color: const Color(0xffe8ebf1)),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 17, color: color),
+        const SizedBox(height: 9),
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(
+            value,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+          ),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(icon, size: 17, color: color),
-            const SizedBox(height: 9),
-            FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.centerLeft,
-              child: Text(
-                value,
-                style: const TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-            const SizedBox(height: 3),
-            Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 10, color: Color(0xff8993a5)),
-            ),
-          ],
+        const SizedBox(height: 3),
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 10, color: Color(0xff8993a5)),
         ),
-      );
+      ],
+    ),
+  );
 }
 
 class _ErrorView extends StatelessWidget {
@@ -1244,32 +1420,144 @@ class _ErrorView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.error_outline_rounded, size: 38),
-              const SizedBox(height: 12),
-              Text(message, textAlign: TextAlign.center),
-              const SizedBox(height: 12),
-              FilledButton(onPressed: onRetry, child: const Text('Reintentar')),
-            ],
-          ),
+    child: Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.error_outline_rounded, size: 38),
+          const SizedBox(height: 12),
+          Text(message, textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          FilledButton(onPressed: onRetry, child: const Text('Reintentar')),
+        ],
+      ),
+    ),
+  );
+}
+
+class _MedicalTimeDialog extends StatefulWidget {
+  const _MedicalTimeDialog({required this.initialMinutes});
+
+  final int initialMinutes;
+
+  @override
+  State<_MedicalTimeDialog> createState() => _MedicalTimeDialogState();
+}
+
+class _MedicalTimeDialogState extends State<_MedicalTimeDialog> {
+  late final TextEditingController _hoursController;
+  late final TextEditingController _minutesController;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _hoursController = TextEditingController(
+      text: (widget.initialMinutes ~/ 60).toString(),
+    );
+    _minutesController = TextEditingController(
+      text: (widget.initialMinutes % 60).toString(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _hoursController.dispose();
+    _minutesController.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final hours = int.tryParse(_hoursController.text) ?? -1;
+    final minutes = int.tryParse(_minutesController.text) ?? -1;
+    if (hours < 0 || minutes < 0 || minutes > 59) {
+      setState(() => _error = 'Introduce horas y minutos válidos.');
+      return;
+    }
+    final total = hours * 60 + minutes;
+    if (total > 1440) {
+      setState(() => _error = 'El máximo es de 24 horas.');
+      return;
+    }
+    Navigator.pop(context, total);
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Tiempo de médico'),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Se resta del objetivo pendiente, pero no se suma a las horas trabajadas.',
         ),
-      );
+        const SizedBox(height: 16),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _hoursController,
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Horas',
+                  suffixText: 'h',
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: TextField(
+                controller: _minutesController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Minutos',
+                  suffixText: 'min',
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            _error!,
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        ],
+      ],
+    ),
+    actions: [
+      if (widget.initialMinutes > 0)
+        TextButton(
+          onPressed: () => Navigator.pop(context, 0),
+          child: const Text('Quitar'),
+        ),
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancelar'),
+      ),
+      FilledButton(onPressed: _save, child: const Text('Guardar')),
+    ],
+  );
 }
 
 class MovementDialog extends StatefulWidget {
   const MovementDialog({
     required this.date,
-    required this.accounts,
+    required this.accountId,
+    required this.accountName,
+    required this.accountColor,
     this.movement,
     super.key,
   });
 
   final DateTime date;
-  final List<Map<String, Object?>> accounts;
+  final int accountId;
+  final String accountName;
+  final Color accountColor;
   final WorkMovement? movement;
 
   @override
@@ -1279,7 +1567,6 @@ class MovementDialog extends StatefulWidget {
 class _MovementDialogState extends State<MovementDialog> {
   late TimeOfDay _start;
   late TimeOfDay _end;
-  late int _accountId;
   late final TextEditingController _breakController;
   String? _validationMessage;
 
@@ -1301,7 +1588,6 @@ class _MovementDialogState extends State<MovementDialog> {
             hour: movement.endMinute ~/ 60,
             minute: movement.endMinute % 60,
           );
-    _accountId = movement?.accountId ?? widget.accounts.first['id'] as int;
     _breakController = TextEditingController(
       text: '${movement?.breakMinutes ?? 0}',
     );
@@ -1314,13 +1600,13 @@ class _MovementDialogState extends State<MovementDialog> {
   }
 
   Future<TimeOfDay?> _pickTime(TimeOfDay initial) => showTimePicker(
-        context: context,
-        initialTime: initial,
-        builder: (context, child) => MediaQuery(
-          data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
-          child: child!,
-        ),
-      );
+    context: context,
+    initialTime: initial,
+    builder: (context, child) => MediaQuery(
+      data: MediaQuery.of(context).copyWith(alwaysUse24HourFormat: true),
+      child: child!,
+    ),
+  );
 
   Future<void> _save() async {
     final start = _minuteOf(_start);
@@ -1329,7 +1615,9 @@ class _MovementDialogState extends State<MovementDialog> {
     final gross = end - start + (crosses ? 1440 : 0);
     final breakMinutes = int.tryParse(_breakController.text.trim());
     if (end == start) {
-      setState(() => _validationMessage = 'El inicio y el fin no pueden coincidir.');
+      setState(
+        () => _validationMessage = 'El inicio y el fin no pueden coincidir.',
+      );
       return;
     }
     if (breakMinutes == null || breakMinutes < 0 || breakMinutes >= gross) {
@@ -1341,7 +1629,7 @@ class _MovementDialogState extends State<MovementDialog> {
       WorkMovement(
         id: widget.movement?.id,
         date: dateKey(widget.date),
-        accountId: _accountId,
+        accountId: widget.accountId,
         startMinute: start,
         endMinute: end,
         breakMinutes: breakMinutes,
@@ -1352,85 +1640,94 @@ class _MovementDialogState extends State<MovementDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-        title: Text(widget.movement == null ? 'Añadir tramo' : 'Editar tramo'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              DropdownButtonFormField<int>(
-                initialValue: _accountId,
-                decoration: const InputDecoration(labelText: 'Cuenta'),
-                items: widget.accounts
-                    .map(
-                      (account) => DropdownMenuItem(
-                        value: account['id'] as int,
-                        child: Text(account['name'] as String),
-                      ),
-                    )
-                    .toList(),
-                onChanged: (value) {
-                  if (value != null) setState(() => _accountId = value);
-                },
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () async {
-                        final value = await _pickTime(_start);
-                        if (value != null) setState(() => _start = value);
-                      },
-                      icon: const Icon(Icons.login_rounded, size: 18),
-                      label: Text('Inicio ${_start.format(context)}'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 7),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: () async {
-                    final value = await _pickTime(_end);
-                    if (value != null) setState(() => _end = value);
-                  },
-                  icon: const Icon(Icons.logout_rounded, size: 18),
-                  label: Text('Fin ${_end.format(context)}'),
-                ),
-              ),
-              const SizedBox(height: 9),
-              TextField(
-                controller: _breakController,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'Pausa',
-                  suffixText: 'minutos',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              if (_validationMessage != null) ...[
-                const SizedBox(height: 10),
-                Text(
-                  _validationMessage!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                    fontSize: 12,
+    title: Text(widget.movement == null ? 'Añadir tramo' : 'Editar tramo'),
+    content: SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InputDecorator(
+            decoration: const InputDecoration(
+              labelText: 'Cuenta activa',
+              border: OutlineInputBorder(),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.circle, color: widget.accountColor, size: 14),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    widget.accountName,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 5),
+          const Text(
+            'Para registrar en otra cuenta, cámbiala primero en Cuentas.',
+            style: TextStyle(color: Color(0xff8993a5), fontSize: 11),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () async {
+                    final value = await _pickTime(_start);
+                    if (value != null) setState(() => _start = value);
+                  },
+                  icon: const Icon(Icons.login_rounded, size: 18),
+                  label: Text('Inicio ${_start.format(context)}'),
+                ),
+              ),
             ],
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar'),
+          const SizedBox(height: 7),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                final value = await _pickTime(_end);
+                if (value != null) setState(() => _end = value);
+              },
+              icon: const Icon(Icons.logout_rounded, size: 18),
+              label: Text('Fin ${_end.format(context)}'),
+            ),
           ),
-          FilledButton(onPressed: _save, child: const Text('Guardar')),
+          const SizedBox(height: 9),
+          TextField(
+            controller: _breakController,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Pausa',
+              suffixText: 'minutos',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          if (_validationMessage != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              _validationMessage!,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.error,
+                fontSize: 12,
+              ),
+            ),
+          ],
         ],
-      );
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancelar'),
+      ),
+      FilledButton(onPressed: _save, child: const Text('Guardar')),
+    ],
+  );
 }
 
 String _weekdayShort(int weekday) =>
@@ -1438,13 +1735,81 @@ String _weekdayShort(int weekday) =>
 
 String _longDate(DateTime date) {
   const weekdays = [
-    'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'
+    'lunes',
+    'martes',
+    'miércoles',
+    'jueves',
+    'viernes',
+    'sábado',
+    'domingo',
   ];
   const months = [
-    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
-    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+    'enero',
+    'febrero',
+    'marzo',
+    'abril',
+    'mayo',
+    'junio',
+    'julio',
+    'agosto',
+    'septiembre',
+    'octubre',
+    'noviembre',
+    'diciembre',
   ];
   final weekday = weekdays[date.weekday - 1];
   return '${weekday[0].toUpperCase()}${weekday.substring(1)}, '
       '${date.day} de ${months[date.month - 1]}';
+}
+
+class _DayNoteDialog extends StatefulWidget {
+  const _DayNoteDialog({required this.initialNote});
+
+  final String initialNote;
+
+  @override
+  State<_DayNoteDialog> createState() => _DayNoteDialogState();
+}
+
+class _DayNoteDialogState extends State<_DayNoteDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialNote);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Nota del día'),
+    content: TextField(
+      controller: _controller,
+      autofocus: true,
+      maxLength: 1000,
+      minLines: 3,
+      maxLines: 6,
+      textCapitalization: TextCapitalization.sentences,
+      decoration: const InputDecoration(
+        hintText: 'Añade un detalle sobre esta jornada…',
+        border: OutlineInputBorder(),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancelar'),
+      ),
+      FilledButton(
+        onPressed: () => Navigator.pop(context, _controller.text),
+        child: const Text('Guardar'),
+      ),
+    ],
+  );
 }

@@ -155,15 +155,19 @@ class MobileBackupService {
     final results = await Future.wait<List<Map<String, Object?>>>([
       db.query('accounts', orderBy: 'id'),
       db.query('movements', orderBy: 'date, start_minute'),
-      db.query('days', orderBy: 'date'),
+      db.query('account_days', orderBy: 'date, account_id'),
       db.query('settings', where: 'id = 1', limit: 1),
       db.query('attachments', orderBy: 'created_at'),
+      db.query('account_targets'),
+      db.query('medical_time', orderBy: 'date, account_id'),
     ]);
     final accountRows = results[0];
     final movementRows = results[1];
     final dayRows = results[2];
     final settings = results[3].isEmpty ? null : results[3].first;
     final attachmentRows = results[4];
+    final targetRows = results[5];
+    final medicalRows = results[6];
     final accountIds = <int, String>{
       for (final row in accountRows)
         row['id'] as int: 'mobile-account-${row['id']}',
@@ -200,8 +204,10 @@ class MobileBackupService {
         .map(
           (row) => {
             'date': row['date'],
+            'accountId': accountIds[row['account_id'] as int],
             'kind': row['kind'],
             'note': row['note'],
+            'targetOverride': row['target_override'],
             'attachmentCount': 0,
             'updatedAt': 0,
           },
@@ -230,6 +236,7 @@ class MobileBackupService {
       attachments.add({
         'id': 'mobile-attachment-${row['id']}',
         'date': row['date'],
+        'accountId': accountIds[row['account_id'] as int],
         'name': row['name'],
         'mime': row['mime'],
         'size': part.length,
@@ -245,26 +252,44 @@ class MobileBackupService {
     final counts = <String, int>{};
     for (final attachment in attachments) {
       final date = attachment['date'] as String;
-      counts[date] = (counts[date] ?? 0) + 1;
+      final accountId = attachment['accountId'] as String? ?? '';
+      final key = '$date\u0000$accountId';
+      counts[key] = (counts[key] ?? 0) + 1;
     }
     for (final day in days) {
-      day['attachmentCount'] = counts[day['date']] ?? 0;
+      final key = '${day['date']}\u0000${day['accountId']}';
+      day['attachmentCount'] = counts[key] ?? 0;
     }
-    final targets =
-        (settings?['daily_targets'] as String? ?? '480,480,480,480,480,0,0')
+    final accountTargets = <String, List<int>>{};
+    for (final row in targetRows) {
+      final accountId = accountIds[row['account_id'] as int];
+      if (accountId != null) {
+        accountTargets[accountId] = (row['daily_targets'] as String)
             .split(',')
             .map(int.parse)
             .toList();
-    final overrides = <String, int>{};
-    for (final entry in (settings?['date_overrides'] as String? ?? '').split(
-      ';',
-    )) {
-      final pair = entry.split('=');
-      if (pair.length == 2) {
-        final value = int.tryParse(pair[1]);
-        if (value != null) overrides[pair[0]] = value;
       }
     }
+    final medicalTime = medicalRows
+        .map(
+          (row) => {
+            'date': row['date'],
+            'accountId': accountIds[row['account_id'] as int],
+            'minutes': row['minutes'],
+          },
+        )
+        .toList();
+    final storedActiveId = settings?['active_account_id'] as int?;
+    final activeAccountId =
+        (storedActiveId == null ? null : accountIds[storedActiveId]) ??
+        accountIds.values.firstOrNull;
+    final rawTargets = activeAccountId == null
+        ? (settings?['daily_targets'] as String? ?? '480,480,480,480,480,0,0')
+        : (accountTargets[activeAccountId]?.join(',') ??
+              settings?['daily_targets'] as String? ??
+              '480,480,480,480,480,0,0');
+    final targets = rawTargets.split(',').map(int.parse).toList();
+    const overrides = <String, int>{};
     final createdAt = DateTime.now().toUtc().toIso8601String();
     return (
       parts: parts,
@@ -280,7 +305,10 @@ class MobileBackupService {
           'id': 'app',
           'weekStart': settings?['week_start'] ?? 1,
           'dailyTargets': targets,
+          'accountTargets': accountTargets,
+          'activeAccountId': activeAccountId,
           'dateOverrides': overrides,
+          'medicalTime': medicalTime,
           'updatedAt': 0,
         },
         'attachments': attachments,
@@ -497,6 +525,13 @@ class MobileBackupService {
         final offset = (item['offset'] as num?)?.toInt() ?? -1;
         final length = (item['length'] as num?)?.toInt() ?? 0;
         final date = item['date'];
+        final attachmentAccountId = item['accountId'];
+        if (attachmentAccountId != null &&
+            !accounts.any((account) => account['id'] == attachmentAccountId)) {
+          throw const FormatException(
+            'Un adjunto hace referencia a una cuenta inexistente.',
+          );
+        }
         if (!_validDate(date) ||
             item['name'] is! String ||
             item['mime'] is! String ||
@@ -510,6 +545,7 @@ class MobileBackupService {
         ranges.add((offset, offset + length));
         attachments.add({
           'date': date,
+          'accountId': item['accountId']?.toString(),
           'name': item['name'],
           'mime': item['mime'],
           'size': length,
@@ -561,6 +597,56 @@ class MobileBackupService {
       if (weekStart < 1 || weekStart > 7) {
         throw const FormatException('El inicio de semana no es válido.');
       }
+      final accountTargets = <String, List<int>>{};
+      final rawAccountTargets = settings['accountTargets'];
+      if (rawAccountTargets is Map) {
+        for (final entry in rawAccountTargets.entries) {
+          final rawSchedule = entry.value;
+          if (rawSchedule is! List ||
+              rawSchedule.length != 7 ||
+              rawSchedule.any(
+                (value) => value is! num || value < 0 || value > 1440,
+              )) {
+            throw const FormatException(
+              'Los objetivos de una cuenta de la copia no son válidos.',
+            );
+          }
+          accountTargets[entry.key.toString()] = rawSchedule
+              .map((value) => (value as num).toInt())
+              .toList();
+        }
+      }
+      final medicalTime = <Map<String, Object?>>[];
+      final rawMedicalTime = settings['medicalTime'];
+      if (rawMedicalTime is List) {
+        for (final rawEntry in rawMedicalTime) {
+          if (rawEntry is! Map) {
+            throw const FormatException(
+              'La copia contiene un registro médico no válido.',
+            );
+          }
+          final entry = Map<String, Object?>.from(rawEntry);
+          final accountId = entry['accountId']?.toString();
+          final minutes = entry['minutes'];
+          if (!_validDate(entry['date']) ||
+              accountId == null ||
+              !accounts.any((account) => account['id'] == accountId) ||
+              minutes is! num ||
+              minutes != minutes.round() ||
+              minutes < 1 ||
+              minutes > 1440) {
+            throw const FormatException(
+              'La copia contiene un registro médico no válido.',
+            );
+          }
+          medicalTime.add({
+            'date': entry['date'],
+            'accountId': accountId,
+            'minutes': minutes.toInt(),
+          });
+        }
+      }
+      final activeAccountId = settings['activeAccountId'] as String?;
       await _database.restoreBackupData(
         accounts: accounts,
         movements: movements,
@@ -569,6 +655,9 @@ class MobileBackupService {
         targets: rawTargets.map((value) => (value as num).toInt()).toList(),
         overrides: overrides,
         weekStart: weekStart,
+        accountTargets: accountTargets,
+        medicalTime: medicalTime,
+        activeAccountId: activeAccountId,
       );
     } finally {
       await handle.close();
@@ -610,7 +699,18 @@ class MobileBackupService {
       }
     }
     for (final day in days) {
-      if (!_validDate(day['date'])) {
+      final accountId = day['accountId']?.toString();
+      final kind = day['kind'];
+      final targetOverride = day['targetOverride'];
+      if (!_validDate(day['date']) ||
+          (accountId != null && !ids.contains(accountId)) ||
+          (kind != null &&
+              !DayKind.values.any((value) => value.name == kind)) ||
+          (targetOverride != null &&
+              (targetOverride is! num ||
+                  targetOverride != targetOverride.round() ||
+                  targetOverride < 0 ||
+                  targetOverride > 1440))) {
         throw const FormatException('La copia contiene una fecha no válida.');
       }
     }

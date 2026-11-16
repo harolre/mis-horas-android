@@ -34,15 +34,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _saving = false;
   String? _error;
   int _weekStart = 1;
+  List<Map<String, Object?>> _accounts = [];
+  int? _targetAccountId;
+  int? _activeAccountId;
 
   @override
   void initState() {
     super.initState();
+    _database.revision.addListener(_onDatabaseChanged);
     _load();
   }
 
   @override
   void dispose() {
+    _database.revision.removeListener(_onDatabaseChanged);
     for (final controller in _controllers) {
       controller.dispose();
     }
@@ -52,20 +57,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
+      final accounts = await _database.accounts();
+      final activeAccountId = await _database.activeAccountId();
+      final selectedAccountId =
+          accounts.any((account) => account['id'] == _targetAccountId)
+          ? _targetAccountId!
+          : activeAccountId;
       final results = await Future.wait<Object>([
-        _database.dailyTargets(),
+        _database.dailyTargets(accountId: selectedAccountId),
         _database.weekStart(),
       ]);
       if (!mounted) return;
-      final targets = results[0] as List<int>;
-      for (var index = 0; index < 7; index++) {
-        _controllers[index].text = targets[index] == 0
-            ? '0'
-            : (targets[index] / 60)
-                  .toStringAsFixed(targets[index] % 60 == 0 ? 0 : 2)
-                  .replaceFirst(RegExp(r'\.?0+$'), '');
-      }
+      _setControllerTargets(results[0] as List<int>);
       setState(() {
+        _accounts = accounts;
+        _targetAccountId = selectedAccountId;
+        _activeAccountId = activeAccountId;
         _weekStart = results[1] as int;
         _loading = false;
         _error = null;
@@ -76,6 +83,60 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _loading = false;
         _error = error.toString();
       });
+    }
+  }
+
+  void _setControllerTargets(List<int> targets) {
+    for (var index = 0; index < 7; index++) {
+      _controllers[index].text = targets[index] == 0
+          ? '0'
+          : (targets[index] / 60)
+                .toStringAsFixed(targets[index] % 60 == 0 ? 0 : 2)
+                .replaceFirst(RegExp(r'\.?0+$'), '');
+    }
+  }
+
+  void _onDatabaseChanged() {
+    if (mounted && !_saving) _refreshAccounts();
+  }
+
+  Future<void> _refreshAccounts() async {
+    try {
+      final accounts = await _database.accounts();
+      final activeAccountId = await _database.activeAccountId();
+      if (!mounted) return;
+      final accountChanged = activeAccountId != _activeAccountId;
+      final selectedAccountId =
+          accountChanged ||
+              !accounts.any((account) => account['id'] == _targetAccountId)
+          ? activeAccountId
+          : _targetAccountId!;
+      setState(() {
+        _accounts = accounts;
+        _activeAccountId = activeAccountId;
+      });
+      if (selectedAccountId != _targetAccountId) {
+        await _selectTargetAccount(selectedAccountId);
+      }
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    }
+  }
+
+  Future<void> _selectTargetAccount(int? accountId) async {
+    if (accountId == null || accountId == _targetAccountId) return;
+    setState(() {
+      _targetAccountId = accountId;
+      _saving = true;
+      _error = null;
+    });
+    try {
+      final targets = await _database.dailyTargets(accountId: accountId);
+      if (mounted) _setControllerTargets(targets);
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
   }
 
@@ -99,7 +160,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _error = null;
     });
     try {
-      await _database.saveDailyTargets(targets);
+      final accountId = _targetAccountId;
+      if (accountId == null) {
+        throw StateError('Selecciona una cuenta para guardar sus objetivos.');
+      }
+      await _database.saveDailyTargets(targets, accountId: accountId);
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -271,12 +336,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
             padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
             children: [
               const Text(
-                'Objetivo de trabajo',
+                'Objetivos por cuenta',
                 style: TextStyle(fontSize: 21, fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 5),
               const Text(
-                'Define las horas previstas para cada día. Las vacaciones, festivos y bajas descuentan el objetivo del día.',
+                'Cada cuenta puede tener un horario distinto. Los días de vacaciones, festivo o baja no suman objetivo.',
                 style: TextStyle(
                   color: Color(0xff798397),
                   height: 1.45,
@@ -284,6 +349,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               const SizedBox(height: 18),
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 5,
+                  ),
+                  child: DropdownButtonFormField<int>(
+                    initialValue: _targetAccountId,
+                    decoration: const InputDecoration(
+                      labelText: 'Cuenta cuyos objetivos editas',
+                      border: InputBorder.none,
+                    ),
+                    items: _accounts
+                        .map(
+                          (account) => DropdownMenuItem(
+                            value: account['id'] as int,
+                            child: Text(
+                              account['id'] == _activeAccountId
+                                  ? '${account['name']} · Activa'
+                                  : account['name'] as String,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: _saving ? null : _selectTargetAccount,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
               Card(
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(18),
@@ -311,6 +408,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               const SizedBox(height: 12),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Horas previstas por día',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+              const SizedBox(height: 8),
               Card(
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(21),

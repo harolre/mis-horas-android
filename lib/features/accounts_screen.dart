@@ -26,7 +26,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
   bool _loading = true;
   String? _error;
   List<Map<String, Object?>> _accounts = [];
-  List<WorkMovement> _movements = [];
+  Map<int, int> _workedByAccount = {};
+  int? _activeAccountId;
 
   @override
   void initState() {
@@ -53,12 +54,14 @@ class _AccountsScreenState extends State<AccountsScreen> {
     try {
       final results = await Future.wait<Object>([
         _database.allAccounts(),
-        _database.allMovements(),
+        _database.workedMinutesByAccount(),
+        _database.activeAccountId(),
       ]);
       if (!mounted) return;
       setState(() {
         _accounts = results[0] as List<Map<String, Object?>>;
-        _movements = results[1] as List<WorkMovement>;
+        _workedByAccount = results[1] as Map<int, int>;
+        _activeAccountId = results[2] as int;
         _loading = false;
       });
     } catch (error) {
@@ -78,7 +81,8 @@ class _AccountsScreenState extends State<AccountsScreen> {
     if (result == null) return;
     try {
       if (account == null) {
-        await _database.createAccount(result.name, result.color);
+        final id = await _database.createAccount(result.name, result.color);
+        await _database.setActiveAccount(id);
       } else {
         await _database.updateAccount(
           account['id'] as int,
@@ -106,12 +110,27 @@ class _AccountsScreenState extends State<AccountsScreen> {
     }
   }
 
+  Future<void> _selectAccount(Map<String, Object?> account) async {
+    if (account['archived'] == 1) return;
+    final id = account['id'] as int;
+    if (id == _activeAccountId) return;
+    try {
+      await _database.setActiveAccount(id);
+      await _load();
+      _showMessage('Ahora estás registrando en «${account['name']}».');
+    } catch (error) {
+      _showMessage(error.toString().replaceFirst('Bad state: ', ''));
+    }
+  }
+
   Future<void> _delete(Map<String, Object?> account) async {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Eliminar cuenta'),
-        content: Text('¿Eliminar «${account['name']}»? Esta acción no se puede deshacer.'),
+        content: Text(
+          '¿Eliminar «${account['name']}»? Esta acción no se puede deshacer.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -137,127 +156,197 @@ class _AccountsScreenState extends State<AccountsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
-  int _minutesFor(int id) => sumWorked(
-        _movements.where((movement) => movement.accountId == id),
-      );
+  int _minutesFor(int id) => _workedByAccount[id] ?? 0;
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-          title: const Text('Cuentas',
-              style: TextStyle(fontWeight: FontWeight.w800)),
-          actions: [
-            IconButton(
-              tooltip: 'Añadir cuenta',
-              onPressed: () => _editAccount(),
-              icon: const Icon(Icons.add_rounded),
-            ),
-          ],
-        ),
-        floatingActionButton: FloatingActionButton.extended(
+    appBar: AppBar(
+      title: const Text(
+        'Cuentas',
+        style: TextStyle(fontWeight: FontWeight.w800),
+      ),
+      actions: [
+        IconButton(
+          tooltip: 'Añadir cuenta',
           onPressed: () => _editAccount(),
           icon: const Icon(Icons.add_rounded),
-          label: const Text('Nueva cuenta'),
         ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _error != null
-                ? Center(child: Text(_error!))
-                : RefreshIndicator(
-                    onRefresh: _load,
-                    child: ListView(
-                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 100),
-                      children: [
-                        const Text(
-                          'Organiza tus jornadas por cliente, proyecto o tipo de trabajo.',
-                          style: TextStyle(
-                              color: Color(0xff798397), height: 1.4),
-                        ),
-                        const SizedBox(height: 20),
-                        ..._accounts.map(_accountTile),
-                        if (_accounts.isEmpty)
-                          const Padding(
-                            padding: EdgeInsets.only(top: 50),
-                            child: Center(child: Text('Todavía no hay cuentas.')),
-                          ),
-                      ],
-                    ),
+      ],
+    ),
+    floatingActionButton: FloatingActionButton.extended(
+      onPressed: () => _editAccount(),
+      icon: const Icon(Icons.add_rounded),
+      label: const Text('Nueva cuenta'),
+    ),
+    body: _loading
+        ? const Center(child: CircularProgressIndicator())
+        : _error != null
+        ? Center(child: Text(_error!))
+        : RefreshIndicator(
+            onRefresh: _load,
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 100),
+              children: [
+                const Text(
+                  'Organiza tus jornadas por cliente, proyecto o tipo de trabajo.',
+                  style: TextStyle(color: Color(0xff798397), height: 1.4),
+                ),
+                const SizedBox(height: 20),
+                if (_accounts.isNotEmpty) _activeAccountCard(),
+                ..._accounts.map(_accountTile),
+                if (_accounts.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 50),
+                    child: Center(child: Text('Todavía no hay cuentas.')),
                   ),
-      );
+              ],
+            ),
+          ),
+  );
+
+  Widget _activeAccountCard() {
+    final active = _accounts.where(
+      (account) => account['id'] == _activeAccountId,
+    );
+    if (active.isEmpty) return const SizedBox.shrink();
+    final account = active.first;
+    final name = account['name'] as String;
+    final color = Color(account['color'] as int);
+    return Card(
+      color: color.withValues(alpha: 0.08),
+      margin: const EdgeInsets.only(bottom: 18),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: ListTile(
+        leading: Icon(Icons.radio_button_checked_rounded, color: color),
+        title: const Text(
+          'Cuenta activa para registrar',
+          style: TextStyle(fontSize: 12, color: Color(0xff798397)),
+        ),
+        subtitle: Text(
+          name,
+          style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+        ),
+      ),
+    );
+  }
 
   Widget _accountTile(Map<String, Object?> account) {
     final id = account['id'] as int;
     final name = account['name'] as String;
     final color = Color(account['color'] as int);
     final archived = account['archived'] == 1;
+    final selected = id == _activeAccountId && !archived;
     final minutes = _minutesFor(id);
     return Card(
       margin: const EdgeInsets.only(bottom: 11),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(15, 14, 6, 14),
-        child: Row(
-          children: [
-            Container(
-              width: 46,
-              height: 46,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.12),
-                borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        onTap: archived ? null : () => _selectAccount(account),
+        borderRadius: BorderRadius.circular(20),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(15, 14, 6, 14),
+          child: Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Text(
+                  name.substring(0, 1).toUpperCase(),
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
               ),
-              child: Text(
-                name.substring(0, 1).toUpperCase(),
-                style: TextStyle(
-                    color: color, fontSize: 18, fontWeight: FontWeight.w800),
-              ),
-            ),
-            const SizedBox(width: 13),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Flexible(
-                        child: Text(name,
+              const SizedBox(width: 13),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            name,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
-                                fontWeight: FontWeight.w800, fontSize: 15)),
-                      ),
-                      if (archived) ...[
-                        const SizedBox(width: 7),
-                        const Text('Archivada',
+                              fontWeight: FontWeight.w800,
+                              fontSize: 15,
+                            ),
+                          ),
+                        ),
+                        if (archived) ...[
+                          const SizedBox(width: 7),
+                          const Text(
+                            'Archivada',
                             style: TextStyle(
-                                color: Color(0xff8993a5), fontSize: 10)),
+                              color: Color(0xff8993a5),
+                              fontSize: 10,
+                            ),
+                          ),
+                        ],
+                        if (selected) ...[
+                          const SizedBox(width: 7),
+                          const Text(
+                            'Activa',
+                            style: TextStyle(
+                              color: Color(0xff3978f6),
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${formatMinutes(minutes)} registradas',
+                      style: const TextStyle(
+                        color: Color(0xff8993a5),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (!archived && !selected)
+                IconButton(
+                  tooltip: 'Usar para registrar',
+                  onPressed: () => _selectAccount(account),
+                  icon: const Icon(Icons.radio_button_unchecked_rounded),
+                )
+              else if (selected)
+                IconButton(
+                  tooltip: 'Cuenta activa',
+                  onPressed: null,
+                  icon: const Icon(
+                    Icons.check_circle_rounded,
+                    color: Color(0xff3978f6),
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${formatMinutes(minutes)} registradas',
-                    style: const TextStyle(
-                        color: Color(0xff8993a5), fontSize: 12),
+                ),
+              PopupMenuButton<String>(
+                onSelected: (action) {
+                  if (action == 'edit') _editAccount(account);
+                  if (action == 'archive') _toggleArchive(account);
+                  if (action == 'delete') _delete(account);
+                },
+                itemBuilder: (context) => [
+                  const PopupMenuItem(value: 'edit', child: Text('Editar')),
+                  PopupMenuItem(
+                    value: 'archive',
+                    child: Text(archived ? 'Reactivar' : 'Archivar'),
                   ),
+                  const PopupMenuItem(value: 'delete', child: Text('Eliminar')),
                 ],
               ),
-            ),
-            PopupMenuButton<String>(
-              onSelected: (action) {
-                if (action == 'edit') _editAccount(account);
-                if (action == 'archive') _toggleArchive(account);
-                if (action == 'delete') _delete(account);
-              },
-              itemBuilder: (context) => [
-                const PopupMenuItem(value: 'edit', child: Text('Editar')),
-                PopupMenuItem(
-                  value: 'archive',
-                  child: Text(archived ? 'Reactivar' : 'Archivar'),
-                ),
-                const PopupMenuItem(value: 'delete', child: Text('Eliminar')),
-              ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -285,7 +374,9 @@ class _AccountDialogState extends State<_AccountDialog> {
   @override
   void initState() {
     super.initState();
-    _name = TextEditingController(text: widget.account?['name'] as String? ?? '');
+    _name = TextEditingController(
+      text: widget.account?['name'] as String? ?? '',
+    );
     _color = widget.account?['color'] as int? ?? _accountColors.first;
   }
 
@@ -297,70 +388,69 @@ class _AccountDialogState extends State<_AccountDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-        title: Text(widget.account == null ? 'Nueva cuenta' : 'Editar cuenta'),
-        content: SizedBox(
-          width: 360,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              TextField(
-                controller: _name,
-                autofocus: true,
-                maxLength: 40,
-                textCapitalization: TextCapitalization.sentences,
-                decoration: const InputDecoration(
-                  labelText: 'Nombre',
-                  hintText: 'Ej. Cliente A',
-                  border: OutlineInputBorder(),
+    title: Text(widget.account == null ? 'Nueva cuenta' : 'Editar cuenta'),
+    content: SizedBox(
+      width: 360,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _name,
+            autofocus: true,
+            maxLength: 40,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: const InputDecoration(
+              labelText: 'Nombre',
+              hintText: 'Ej. Cliente A',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Text('Color', style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 11,
+            runSpacing: 10,
+            children: _accountColors.map((value) {
+              final selected = _color == value;
+              return InkWell(
+                onTap: () => setState(() => _color = value),
+                customBorder: const CircleBorder(),
+                child: Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: Color(value),
+                    shape: BoxShape.circle,
+                    border: selected
+                        ? Border.all(color: Colors.black87, width: 3)
+                        : null,
+                  ),
+                  child: selected
+                      ? const Icon(Icons.check, color: Colors.white, size: 19)
+                      : null,
                 ),
-              ),
-              const SizedBox(height: 14),
-              const Text('Color',
-                  style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 11,
-                runSpacing: 10,
-                children: _accountColors.map((value) {
-                  final selected = _color == value;
-                  return InkWell(
-                    onTap: () => setState(() => _color = value),
-                    customBorder: const CircleBorder(),
-                    child: Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        color: Color(value),
-                        shape: BoxShape.circle,
-                        border: selected
-                            ? Border.all(color: Colors.black87, width: 3)
-                            : null,
-                      ),
-                      child: selected
-                          ? const Icon(Icons.check, color: Colors.white, size: 19)
-                          : null,
-                    ),
-                  );
-                }).toList(),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancelar'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final name = _name.text.trim();
-              if (name.isNotEmpty) {
-                Navigator.pop(context, _AccountDraft(name, _color));
-              }
-            },
-            child: const Text('Guardar'),
+              );
+            }).toList(),
           ),
         ],
-      );
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancelar'),
+      ),
+      FilledButton(
+        onPressed: () {
+          final name = _name.text.trim();
+          if (name.isNotEmpty) {
+            Navigator.pop(context, _AccountDraft(name, _color));
+          }
+        },
+        child: const Text('Guardar'),
+      ),
+    ],
+  );
 }
